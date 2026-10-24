@@ -1,0 +1,43 @@
+/build/
+/tests/
+# Lokale opnamen, screenshots en meetuitvoer horen niet in de bronrepository.
+*.cf32
+*.iq
+*.cs16
+*.cu8
+*.sigmf-data
+*.sigmf-meta
+*.png
+!/docs/images/pal-color-reception.png
+*.jpg
+*.jpeg
+*.pgm
+*.ppm
+*.wav
+*.mp4
+*.log
+/captures/
+/recordings/
+/screenshots/
+/measurements/
+/uhd-images/
+
+# Gebouwde software, downloads en Python-cache.
+*.o
+*.a
+*.so
+*.so.*
+*.dll
+*.exe
+*.zip
+*.tar.gz
+__pycache__/
+*.py[cod]
+.venv/
+
+# Persoonlijke instellingen en lokale werknotities.
+/.atv-rx.conf
+/AGENTS.md
+/TODO.md
+.DS_Store
+Thumbs.db

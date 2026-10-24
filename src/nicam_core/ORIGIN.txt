@@ -1,0 +1,18 @@
+Imported from https://github.com/pe1itr/nicam at commit 25f06a1.
+Original project: nicam-direct-qpsk, Apache-2.0 (see LICENSE).
+
+Local changes:
+- core.c/core.h expose the existing fixed adaptive decoder as an in-process
+  blocking stream API. No subprocess, SDR access, stdin or speaker ownership.
+- input.c/output.c route IQ/PCM through callbacks.
+- demod.c reports validated frame quality and frees temporary allocations on
+  acquisition reset (the upstream early continue skipped that cleanup).
+- The scrambler table is thread-local to allow independent receiver instances.
+- Live mode uses silence concealment instead of deferred interpolation.
+- Receiver carrier/timing gains are 0.04/0.05 (upstream 0.15/automatic 0.11
+  at four samples/symbol), reducing noise-driven tracking jitter. Frame
+  validation thresholds are unchanged. Covered by test_nicam_sensitivity.c.
+- The adaptive interpolator preserves the final IQ sample across input blocks;
+  tracking state and decoded bits are invariant to block boundaries.
+The original CLI entry point is private and unused.
+The CLI source is retained for provenance; the application does not invoke it.

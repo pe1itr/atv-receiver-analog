@@ -1,0 +1,35 @@
+FM ATV - Windows 10/11 x64
+
+STARTEN
+1. Pak de hele ZIP uit naar een gewone map.
+2. Sluit de PlutoSDR of HackRF aan en dubbelklik op atv-rx.exe.
+3. Kies W + Enter, daarna 2 voor HackRF of 3 voor PlutoSDR.
+   Enter slaat de wizard over en gebruikt de bewaarde instellingen.
+   Zonder bewaarde instellingen start de demo.
+4. Druk tijdens ontvangst op W om instellingen te bewaren.
+
+Laat de DLL's, modules en font.ttf bij het programma staan.
+In licenses staan de licentieteksten van meegeleverde onderdelen.
+
+USB-DRIVER (eenmalig installeren indien nodig)
+PlutoSDR: installeer de officiele Analog Devices Windows-driver:
+https://github.com/analogdevicesinc/plutosdr-m2k-drivers-win/releases
+HackRF: volg de officiele instructies voor WinUSB/Zadig:
+https://github.com/greatscottgadgets/hackrf/blob/main/host/README.md
+Selecteer in Zadig alleen de HackRF.
+
+BEDIENING
+! = toetsenuitleg, pijltjes omhoog/omlaag = gain, N = geluidsbron,
+A = dempen, P = screenshot, Esc = afsluiten.
+Kies de geluidsuitgang in de wizard; 0 = Windows-standaarduitgang.
+Bij 10 MS/s is geen audio beschikbaar. FM 6 MHz en NICAM vereisen
+samplerate en video-IF van minstens 14 MHz; 7 MHz stereo minstens 16 MHz.
+
+INSTELLINGEN EN PROBLEMEN
+Configuratie (atv-rx.conf) en log (atv-rx.log) staan in:
+%APPDATA%\PE1ITR\ATV Receiver\
+Stuur bij een probleem het log mee, met de gebruikte SDR en samplerate.
+Het log wordt bij elke start vervangen.
+
+Dit pakket ondersteunt PlutoSDR en HackRF. B210 is niet inbegrepen.
+SDRplay vereist extra software; zie de README in de projectrepository.
