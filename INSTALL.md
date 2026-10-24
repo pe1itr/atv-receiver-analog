@@ -21,7 +21,7 @@ Windows-verpakkingsscripts gebruiken specifiek Fedora-paden en RPM-pakketten.
 
 Laat de DLL's, `modules` en `font.ttf` bij het programma staan. De doelplatforms
 zijn Windows 10 vanaf 1903 en Windows 11, x64. B210/UHD is niet meegebouwd.
-SDRplay vereist extra installatie; zie de [README](README.md#sdrplay-rsp1b-experimenteel).
+SDRplay vereist extra installatie; zie de [README](README.md#sdrplay-rsp1b-experimental).
 
 ## Linux compileren
 
@@ -122,13 +122,13 @@ make bench
   Controleer de detectie met `SoapySDRUtil --find="driver=hackrf"` als dit
   hulpprogramma is geïnstalleerd. De Linux-Makefile bouwt de module niet zelf.
 - **PlutoSDR:** bouw met de ondersteunde libiio-versie en configureer USB-toegang
-  of een netwerk-URI. Zie de [Pluto-instructies](README.md#plutosdr--ad9361--rx1).
+  of een netwerk-URI. Zie de [Pluto-instructies](README.md#plutosdr--ad9361).
 - **B210:** geef de passende firmware-/FPGA-map op met
   `--uhd-images-dir /pad/naar/images`. Standaard zoekt de ontvanger in
   `uhd-images/` ten opzichte van de huidige werkmap. Voor de beschreven Kintex-7-kloon zijn
   andere images nodig dan voor een standaard Ettus B210.
 - **SDRplay:** installeer de officiële API en SoapySDRPlay3 apart;
-  zie de [SDRplay-instructies](README.md#sdrplay-rsp1b-experimenteel).
+  zie de [SDRplay-instructies](README.md#sdrplay-rsp1b-experimental).
 
 Er is geen `make install`-doel. Je kunt het programma vanuit `build/` blijven
 starten. Optioneel installeer je alleen de ontvanger in je eigen gebruikersmap:
