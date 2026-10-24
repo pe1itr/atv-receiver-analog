@@ -106,6 +106,8 @@ is beschikbaar tot en met 10 MS/s; voor bestanden en demo geldt die beperking ni
 
 ## Snel starten op Windows
 
+Download het Windows x64-pakket via [GitHub Releases](https://github.com/pe1itr/atv-receiver-analog/releases/latest).
+
 1. Pak het volledige Windows x64-pakket uit en installeer zo nodig de
    USB-driver volgens `LEESMIJ.txt` in het pakket.
 2. Start `atv-rx.exe`. Kies **W + Enter** om de ontvanger in te stellen,
