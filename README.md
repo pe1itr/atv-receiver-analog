@@ -93,6 +93,14 @@ Shared libraries and hardware drivers must remain installed on the system.
 
 ## Hardware and bandwidth
 
+**Best results in the project's practical reception tests were obtained with
+the OpenSourceSDRLab B210 Kintex-7 model described below.** Its **USB 3.0**
+connection provides more transport headroom for the high sample rates used
+for full-bandwidth FM-ATV reception. Connect it to a USB 3.0 port with a
+suitable USB 3.0 cable. This recommendation is based on the tested setup;
+performance still depends on the host computer and configuration. B210 support
+is available in the Linux build, not in the current Windows package.
+
 | Source | Linux | Windows package |
 | --- | --- | --- |
 | PlutoSDR / AD9361 | Optional libiio >= 0.23 and < 1.0 | Included; USB or network |
