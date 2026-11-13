@@ -15,8 +15,10 @@ The receiver supports two main uses:
 - **Full picture and sound:** PAL color with FM mono, FM stereo or NICAM audio,
   provided the sample rate, bandwidth and received signal support them.
 - **Weak-signal DX:** monochrome reception with free-running synchronization
-  and frame stacking. Live SDR stacking is available at sample rates up to
-  **10 MS/s**. The demo and IQ-file sources do not have this stacking limit.
+  and frame stacking. Live contest stacking is available up to **10 MS/s**.
+  Above 10 MS/s, **S** toggles lightweight rolling RGB smoothing over six
+  pictures, using the full TV area. Demo/IQ-file sources also support explicit
+  contest stacking through the command-line options.
 
 PAL timing is 625 lines, 15,625 lines/s and 50 fields/s. Each field is displayed
 as a 640 × 288 picture stretched to 4:3. The decoder does not combine two
@@ -39,7 +41,7 @@ The package targets Windows 10 version 1903 or later and Windows 11, x64.
 
 Pressing **Enter** at startup uses saved settings. With no saved settings,
 it starts the demo. Keep all DLLs, the `modules` folder and `font.ttf` beside
-the executable. **! (Shift+1)** opens the controls screen; **Esc** exits.
+the executable. **! (Shift+1)** opens the controls screen; **Q** or **Esc** exits.
 
 The Windows package includes HackRF and PlutoSDR support. UHD/B210 is not
 included. SDRplay needs additional software as described below. The package
@@ -292,19 +294,34 @@ does not compensate for spectral inversion introduced by a converter.
 | `B` / `V` | Shift vertical position by one line in free-running mode |
 | `I` | Invert FM video polarity |
 | `D` | Switch FM0/FM1 demodulation |
+| `O` | Switch between the TV picture and the video oscilloscope |
+| `F9` | Start/stop a raw IQ recording; saves automatically after 3 seconds |
 | `A` | Mute/unmute audio |
 | `N` | Cycle FM mono, NICAM and the two FM stereo pairs |
 | Shift+N | Swap left/right for FM stereo |
-| `S` / stack button | Enable/disable frame stacking |
+| `S` / stack button | Toggle stacking; above 10 MS/s: lightweight rolling 6, full TV area |
 | `M` / FIXED/ROLLING | Switch stacking mode and restart the stack |
 | `-` / `+` | Change stack size, 1–512 fields |
 | `R` / Reset | Clear the stack |
-| `P` | Save a PNG screenshot of the full window |
+| `P` | Save a full-window PNG, averaging the live picture over approximately 120 ms |
+| `Ctrl+P` | Save a full-window PNG of one instantaneous image |
 | Shift+P / Pause | Pause/resume stacking while keeping the result |
-| Esc | Exit |
+| `Q` / Esc | Exit |
 
 Screenshots are saved in the working directory with frequency and UTC time
-in the filename. `--snapshot PATH` also supports saving a BMP on exit.
+in the filename. The short exposure combines distinct live images without
+requiring sync lock, keeps colour, and can soften moving objects. When stacking
+is enabled, the stacked pane is saved as displayed and only the live pane is
+averaged. `Ctrl+P` captures one instant instead. `--snapshot PATH` also supports
+saving a BMP on exit.
+
+Press `O` to replace the TV picture with a video oscilloscope, and `O` again
+to return. The trace shows two line periods (about 128 microseconds), including
+sync pulses and video content, after video IF filtering, FM demodulation and
+the selected de-emphasis. It uses a sync pulse trigger when possible and runs
+freely otherwise. A pulse trigger does not imply PAL sync lock. Amplitude is
+automatically scaled in demodulated FM units, not volts. `P` saves the displayed
+scope trace. Reception, audio and picture decoding continue in scope mode.
 
 ### AFC and FM detector selection
 
@@ -326,6 +343,11 @@ universally optimal mode.
 
 ## Weak-signal reception and stacking
 
+Vertical synchronization compares broad-sync candidates over a complete field
+before selecting the strongest one, then requires consistent timing across
+three fields. This prevents an earlier dark picture feature from hiding the
+real sync pulse and producing a stationary picture at the wrong vertical position.
+
 Stacking averages accepted, aligned field pictures to reduce noise. With
 reliable sync, received raster timing determines alignment. Without reliable
 sync, image matching is used while the raster clock continues running.
@@ -333,13 +355,30 @@ Incomplete or unreliable pictures are rejected. `HOLD` preserves the current
 result while waiting for usable fields; `SKIP` counts pictures skipped by a
 busy stacking worker, while `DROPS` counts discontinuities in the IQ stream.
 
+Above **10 MS/s**, press **S** for a lightweight rolling average of the last
+**six displayed pictures** (about 120 ms), and press S again to return immediately to live
+video. This keeps RGB colour and the full TV area, without the separate live
+pane or image-registration work. The first five pictures warm up the window;
+it then continuously replaces the oldest picture. Motion can soften slightly.
+The bounded background worker never makes live SDR reception wait for averaging.
+Tuning, input gaps and sync resets clear its history. **W** remembers the toggle,
+and **P** saves the displayed six-picture result without extra averaging.
+The window stays fixed at six; size, pause and fixed/rolling controls apply
+to the separate contest stack. Explicit `--stack-frames`/`--stack-rolling`
+options still select the contest stack for offline IQ files and the demo.
+
+![Weak-signal reception at 2387 MHz with a six-picture rolling stack](docs/images/weak-signal-2387mhz-rolling-stack.png)
+
+*Reception at 2387 MHz and 20 MS/s, using a 6 MHz video IF and the lightweight
+six-picture rolling stack (about 120 ms). The picture uses the full TV area.*
+
 - **FIXED:** accumulate the requested number of fields, then freeze at `DONE`.
 - **ROLLING:** average the latest N accepted fields, replacing the oldest one
   with each new accepted field. Rejected fields and pauses do not advance it.
 
 Use **R** to reset, **M** to change mode, and **Shift+P** to pause/resume.
-Changing the rolling window size starts a new stack. Live SDR stacking is
-limited to **10 MS/s**; higher rates display live video without stacking.
+Changing the rolling window size starts a new stack. Live SDR contest stacking
+is limited to **10 MS/s**; higher rates use the lightweight six-picture mode.
 
 The separate sync/alignment IF defaults to 3.2 MHz. `--alignment-bandwidth 0`
 uses the video IF for both paths. The `[` and `]` controls change only the
@@ -383,7 +422,22 @@ Supply the correct sample rate and modulation settings:
 Tuning and gain do not change samples during file playback or the demo.
 IF filtering, polarity and synchronization settings still apply.
 
-To capture a short live sample, add these options to a hardware command:
+Press **F9** to capture raw IQ samples before digital IF filtering. By default
+the capture stops after **3 seconds** and saves in the current working
+directory, without stopping reception. Press F9 again to stop early. The screen
+shows preparation, capture progress, saving and the resulting filename.
+Allocation and disk writes run on a separate thread.
+
+Each capture gets a unique frequency/UTC filename ending in `.cf32`, plus a
+`.cf32.json` file containing the actual reception settings, sample count, stop
+reason and a `playback_command`. Tuning, setting changes, a pause or an input
+gap end the current capture, preserving its contiguous prefix. Quitting saves
+any partial recording. Use `--record-seconds N` to change the duration, with
+limits of 15 seconds and 2 GiB per capture. At 20 MS/s, three seconds uses
+approximately **480 MB** of RAM and disk space. F9 is unavailable while the
+separate CLI `--record` option is active.
+
+To use the existing recording-on-startup mode, add these options to a hardware command:
 
 ```text
 --record captures/recording.cf32 --record-seconds 3 --seconds 5
@@ -486,8 +540,8 @@ a Windows computer with actual SDR hardware.
 | `INSTALL.md` | Detailed installation guide in Dutch |
 
 `build/`, `tests/`, personal notes, recordings and generated screenshots are
-excluded from the public repository. The selected README image is the only
-screenshot included. Use `captures/` for recordings and `measurements/` or
+excluded from the public repository. The selected README images are the only
+screenshots included. Use `captures/` for recordings and `measurements/` or
 `build/` for analysis output; these directories are ignored by Git.
 
 `make` builds only the receiver. `make tools` optionally builds `atv-tx`

@@ -6,6 +6,7 @@
 typedef struct {
     Config c; /* Frequency is the displayed frequency, including converter LO. */
     int stacking, stack_frames, rolling, paused, vertical_shift;
+    int light_stacking;
     int audio_source, audio_muted, audio_swap;
     char strings[9][1024];
 } Settings;

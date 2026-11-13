@@ -56,8 +56,13 @@ shutil.copy2(root/'scripts/windows/LEESMIJ.txt',out/'LEESMIJ.txt')
 packages=['mingw64-gcc','mingw64-fftw','mingw64-freetype','mingw64-libpng','mingw64-libxml2','mingw64-libusb1','mingw64-bzip2','mingw64-zlib','mingw64-win-iconv','mingw64-winpthreads','mingw64-libstdc++','google-noto-sans-mono-vf-fonts']
 versions=subprocess.check_output(['rpm','-q',*packages],text=True)
 from datetime import datetime,timezone
-info='Windows x64 test build UTC: '+datetime.now(timezone.utc).isoformat()+'\n'
-info+='Built with scripts/build-windows.sh on Fedora 43.\n'
+version=re.search(r'#define ATV_VERSION "([^"]+)"',(root/'src/version.h').read_text()).group(1)
+revision=subprocess.run(['git','rev-parse','HEAD'],cwd=root,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+source_commit=revision.stdout.strip() if revision.returncode==0 else 'unknown (source archive)'
+info=f'FM-ATV Receiver {version} - Windows x64\nSource commit: {source_commit}\n'
+info+='Build UTC: '+datetime.now(timezone.utc).isoformat()+'\n'
+info+='Built with scripts/windows/compile.sh and scripts/package-windows.py on Fedora 43.\n'
+info+='Dependencies prepared with scripts/build-windows.sh.\n'
 info+='SDL 2.32.10; SoapySDR 0.8.1; SoapyHackRF 0.3.4; HackRF 2024.02.1; libiio 0.26.\n'
 info+='FFTW 3.3.10 single precision with SSE2 (x64 baseline), built from source.\n'
 info+='Upstream source URLs and checksums are recorded in the project repository: scripts/build-windows.sh and scripts/windows/deps.sha256\n'

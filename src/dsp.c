@@ -186,6 +186,7 @@ static void vertical_candidate(Decoder *d, uint64_t onset)
     double phase_error=remainder(origin-d->field,period);
     if(!d->vsync_updates || fabs(phase_error)>d->rate*128e-6) {
         ++d->vsync_epoch;
+        d->raster_discard=1;
         d->complete_lines=0; d->row=-1; d->have_line=0;
         for(int k=0;k<WIDTH*HEIGHT;++k) d->pixels[k]=d->guide_pixels[k]=0xff000000u;
         d->hsync_count=0;
@@ -198,6 +199,9 @@ static void vertical_candidate(Decoder *d, uint64_t onset)
         origin=origin-phase_error+.25*phase_error;
         fitted=period+.125*(fitted-period);
     }
+    /* Select the latest onset after smoothing as well: smoothing across a
+     * field boundary must never leave an unsigned timestamp in the future. */
+    origin+=floor(((double)d->tick-origin)/fitted)*fitted;
     d->field=(uint64_t)llround(origin);
     d->vsync_period=fitted;
     d->vsync_confirmed=onset;
@@ -209,16 +213,15 @@ static void vertical_candidate(Decoder *d, uint64_t onset)
  * porches; horizontal sync alone cannot satisfy this long negative trough. */
 static void vertical_sample(Decoder *d, float v)
 {
-    if(d->experimental_sync) {
-        double period=d->vsync_period?d->vsync_period:d->rate/50;
-        if(d->tick-d->vsync_scan_tick>=period) {
-            /* Observe a whole field before choosing: an early dark picture
-             * feature must not hide the actual broad sync in a blind window.
-             * Keep the original three-field timing confirmation afterwards. */
-            if(d->vsync_scan_best) vertical_candidate(d,d->vsync_scan_peak);
-            d->vsync_scan_tick=d->tick;
-            d->vsync_scan_best=0;
-        }
+    double period=d->vsync_period?d->vsync_period:d->rate/50;
+    if(d->tick-d->vsync_scan_tick>=period) {
+        /* Compare a whole field before choosing. A repetitive dark picture
+         * feature may pass the pulse test before the real broad sync. Never
+         * let that first candidate suppress the rest of the field. Keep the
+         * three-field timing confirmation in vertical_candidate afterwards. */
+        if(d->vsync_scan_best) vertical_candidate(d,d->vsync_scan_peak);
+        d->vsync_scan_tick=d->tick;
+        d->vsync_scan_best=0;
     }
     d->vsync_sum+=sync_clip(v); ++d->vsync_samples;
     if(d->tick-d->vsync_bin_tick<d->vsync_bin_samples) return;
@@ -239,18 +242,15 @@ static void vertical_sample(Decoder *d, float v)
      * Once line timing is independently confirmed, accept a smaller contrast;
      * retain the negative-level test and three-field timing confirmation. */
     double threshold=d->hsync_updates && d->fields-d->hsync_field<=2 ? .035 : .06;
-    if(middle<-.06 && score>threshold && score>d->vsync_best &&
-       (d->experimental_sync || !d->vsync_event || d->tick-d->vsync_event>d->rate*.015)) {
+    if(middle<-.06 && score>threshold && score>d->vsync_best) {
         d->vsync_best=score;
         d->vsync_peak=d->tick-(uint64_t)llround(d->rate*224e-6);
     }
     if(d->vsync_best && d->tick-d->vsync_peak>d->rate*400e-6) {
-        if(d->experimental_sync) {
-            if(d->vsync_best>d->vsync_scan_best) {
-                d->vsync_scan_best=d->vsync_best;
-                d->vsync_scan_peak=d->vsync_peak;
-            }
-        } else vertical_candidate(d,d->vsync_peak);
+        if(d->vsync_best>d->vsync_scan_best) {
+            d->vsync_scan_best=d->vsync_best;
+            d->vsync_scan_peak=d->vsync_peak;
+        }
         d->vsync_event=d->tick;
         d->vsync_best=0;
     }
@@ -283,7 +283,11 @@ static void free_raster_clock(Decoder *d, int recover_sync)
             if(!updates || d->fields-last_sync>3) d->stack_valid=0;
             d->hsync_field=d->fields;
         }
-        if (d->frame) d->frame(d->opaque,d->pixels);
+        /* A late field-phase correction can leave only a few microseconds
+         * before this boundary. Do not publish that cleared/partial raster. */
+        if (d->frame && (!d->raster_discard || d->complete_lines>=280))
+            d->frame(d->opaque,d->pixels);
+        d->raster_discard=0;
         d->field += d->raster_field_ticks;
         d->complete_lines = 0;
         if(!d->no_video_raster) for(int k=0;k<WIDTH*HEIGHT;++k) d->pixels[k]=0xff000000;
@@ -615,10 +619,13 @@ static void process(Decoder *d, const IQ *iq, const IQ *guide,
             }
             d->fold_tick=d->tick;
             int bin=(int)(d->fold_phase*128/period)%128;
-            int part=(int)((d->tick-d->field)*150/d->rate);
-            if(part<3) {
-                d->hsync_sum[part][bin]+=sync_clip(d->sync_filtered);
-                ++d->hsync_samples[part][bin];
+            double field_age=((double)d->tick-(double)d->field)/d->rate;
+            if(field_age>=0 && field_age<.020) {
+                int part=(int)(field_age*150);
+                if(part<3) {
+                    d->hsync_sum[part][bin]+=sync_clip(d->sync_filtered);
+                    ++d->hsync_samples[part][bin];
+                }
             }
         }
         int low = d->sync_filtered < (d->low ? -0.13f : -0.17f);

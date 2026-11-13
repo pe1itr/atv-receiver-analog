@@ -2,6 +2,7 @@
 /tests/
 # Lokale opnamen, screenshots en meetuitvoer horen niet in de bronrepository.
 *.cf32
+*.cf32.json
 *.iq
 *.cs16
 *.cu8
@@ -9,6 +10,7 @@
 *.sigmf-meta
 *.png
 !/docs/images/pal-color-reception.png
+!/docs/images/weak-signal-2387mhz-rolling-stack.png
 *.jpg
 *.jpeg
 *.pgm

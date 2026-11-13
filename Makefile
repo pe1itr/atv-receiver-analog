@@ -18,8 +18,8 @@ all: build/atv-rx
 tools: build/atv-tx build/atv-eval
 build:
 	mkdir -p $@
-build/atv-rx: src/video_quality.c src/status_server.c src/driver_status.c src/driver_status.h src/ui_text.c src/ui_text.h src/version.h Makefile src/main.c src/settings.c src/settings.h src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.h src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c src/atv.h src/pal.h src/rx_queue.h src/alignment.h src/sound.h src/source_pluto.h $(NICAM_SRC) $(NICAM_DEPS) | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(RX_BUILD_FLAGS) src/main.c src/video_quality.c src/status_server.c src/driver_status.c src/ui_text.c src/settings.c src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c $(NICAM_SRC) -o $@ $(LDLIBS)
+build/atv-rx: src/video_quality.c src/video_scope.c src/iq_recorder.c src/light_stack.c src/status_server.c src/driver_status.c src/driver_status.h src/ui_text.c src/ui_text.h src/version.h Makefile src/main.c src/settings.c src/settings.h src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.h src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c src/atv.h src/pal.h src/rx_queue.h src/alignment.h src/sound.h src/source_pluto.h $(NICAM_SRC) $(NICAM_DEPS) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(RX_BUILD_FLAGS) src/main.c src/video_quality.c src/video_scope.c src/iq_recorder.c src/light_stack.c src/status_server.c src/driver_status.c src/ui_text.c src/settings.c src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c $(NICAM_SRC) -o $@ $(LDLIBS)
 build/atv-tx: src/atv_tx.c src/test_signal.c src/test_signal.h src/atv.h src/pal.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/atv_tx.c src/test_signal.c -o $@ -lm
 build/atv-eval: src/atv_eval.c src/filter.c src/dsp.c src/pal.c src/atv.h src/pal.h | build
@@ -32,8 +32,8 @@ build/test-stack: tests/test_stack.c src/stack.c src/filter.c src/dsp.c src/pal.
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_stack.c src/stack.c src/filter.c src/dsp.c src/pal.c -o $@ -lfftw3f -lm
 build/test-registration: tests/test_registration.c src/test_signal.c src/stack.c src/filter.c src/dsp.c src/pal.c src/atv.h src/pal.h src/test_signal.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_registration.c src/test_signal.c src/stack.c src/filter.c src/dsp.c src/pal.c -o $@ -lfftw3f -lm
-build/test-stack-worker: src/video_quality.c src/status_server.c src/driver_status.c src/driver_status.h src/ui_text.c src/ui_text.h src/version.h Makefile tests/test_stack_worker.c src/main.c src/settings.c src/settings.h src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.h src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c src/test_signal.c src/atv.h src/pal.h src/test_signal.h src/rx_queue.h src/alignment.h src/sound.h src/source_pluto.h $(NICAM_SRC) $(NICAM_DEPS) | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(RX_BUILD_FLAGS) tests/test_stack_worker.c src/video_quality.c src/status_server.c src/driver_status.c src/ui_text.c src/settings.c src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c src/test_signal.c $(NICAM_SRC) -o $@ $(LDLIBS)
+build/test-stack-worker: src/video_quality.c src/video_scope.c src/iq_recorder.c src/light_stack.c src/status_server.c src/driver_status.c src/driver_status.h src/ui_text.c src/ui_text.h src/version.h Makefile tests/test_stack_worker.c src/main.c src/settings.c src/settings.h src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.h src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c src/test_signal.c src/atv.h src/pal.h src/test_signal.h src/rx_queue.h src/alignment.h src/sound.h src/source_pluto.h $(NICAM_SRC) $(NICAM_DEPS) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(RX_BUILD_FLAGS) tests/test_stack_worker.c src/video_quality.c src/video_scope.c src/iq_recorder.c src/light_stack.c src/status_server.c src/driver_status.c src/ui_text.c src/settings.c src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c src/test_signal.c $(NICAM_SRC) -o $@ $(LDLIBS)
 build/test-rx-queue: tests/test_rx_queue.c src/rx_queue.c src/rx_queue.h src/atv.h src/pal.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_rx_queue.c src/rx_queue.c -o $@ $(LDLIBS)
 build/test-alignment: tests/test_alignment.c src/alignment.c src/alignment.h src/filter.c src/dsp.c src/pal.c src/atv.h src/pal.h | build
@@ -94,8 +94,8 @@ test-settings: build/test-settings
 	./build/test-settings
 test: test-settings
 
-build/test-startup: src/video_quality.c src/status_server.c src/driver_status.c src/driver_status.h src/ui_text.c src/ui_text.h src/version.h Makefile tests/test_startup.c src/main.c src/settings.c src/settings.h src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.h src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c $(NICAM_SRC) $(NICAM_DEPS) | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(RX_BUILD_FLAGS) tests/test_startup.c src/video_quality.c src/status_server.c src/driver_status.c src/ui_text.c src/settings.c src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c $(NICAM_SRC) -o $@ $(LDLIBS)
+build/test-startup: src/video_quality.c src/video_scope.c src/iq_recorder.c src/light_stack.c src/status_server.c src/driver_status.c src/driver_status.h src/ui_text.c src/ui_text.h src/version.h Makefile tests/test_startup.c src/main.c src/settings.c src/settings.h src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.h src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c $(NICAM_SRC) $(NICAM_DEPS) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(RX_BUILD_FLAGS) tests/test_startup.c src/video_quality.c src/video_scope.c src/iq_recorder.c src/light_stack.c src/status_server.c src/driver_status.c src/ui_text.c src/settings.c src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c $(NICAM_SRC) -o $@ $(LDLIBS)
 .PHONY: test-startup
 test-startup: build/test-startup
 	./build/test-startup
@@ -137,8 +137,8 @@ test-fm: build/test-fm build/test-fm-scalar
 	./build/test-fm
 	./build/test-fm-scalar
 
-build/bench-scatter: src/video_quality.c src/status_server.c src/driver_status.c src/driver_status.h src/ui_text.c src/ui_text.h src/version.h Makefile tests/bench_scatter.c src/test_signal.c src/test_signal.h src/main.c src/settings.c src/settings.h src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.h src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c $(NICAM_SRC) $(NICAM_DEPS) | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(RX_BUILD_FLAGS) tests/bench_scatter.c src/test_signal.c src/video_quality.c src/status_server.c src/driver_status.c src/ui_text.c src/settings.c src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c $(NICAM_SRC) -o $@ $(LDLIBS)
+build/bench-scatter: src/video_quality.c src/video_scope.c src/iq_recorder.c src/light_stack.c src/status_server.c src/driver_status.c src/driver_status.h src/ui_text.c src/ui_text.h src/version.h Makefile tests/bench_scatter.c src/test_signal.c src/test_signal.h src/main.c src/settings.c src/settings.h src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.h src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c $(NICAM_SRC) $(NICAM_DEPS) | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(RX_BUILD_FLAGS) tests/bench_scatter.c src/test_signal.c src/video_quality.c src/video_scope.c src/iq_recorder.c src/light_stack.c src/status_server.c src/driver_status.c src/ui_text.c src/settings.c src/sound.c src/source.c src/source_pluto.c src/rx_queue.c src/afc.c src/alignment.c src/filter.c src/dsp.c src/pal.c src/stack.c $(NICAM_SRC) -o $@ $(LDLIBS)
 
 build/bench-fm-pipeline: tests/bench_fm_pipeline.c src/alignment.c src/alignment.h src/filter.c src/dsp.c src/pal.c src/atv.h src/pal.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/bench_fm_pipeline.c src/alignment.c src/filter.c src/dsp.c src/pal.c -o $@ $(LDLIBS)
@@ -186,3 +186,29 @@ build/test-clipping: tests/test_clipping.c src/clipping.h src/atv.h | build
 test-clipping: build/test-clipping
 	./build/test-clipping
 test: test-clipping
+
+# The oscilloscope consumes post-demodulation video independently of PAL lock.
+build/atv-rx build/test-startup build/test-stack-worker build/bench-scatter: src/video_scope.h
+build/test-video-scope: tests/test_video_scope.c src/video_scope.c src/video_scope.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_video_scope.c src/video_scope.c -o $@ -lm
+.PHONY: test-video-scope
+test-video-scope: build/test-video-scope
+	./build/test-video-scope
+test: test-video-scope
+
+# F9 captures IQ in RAM and saves it on a separate thread.
+build/atv-rx build/test-startup build/test-stack-worker build/bench-scatter: src/iq_recorder.h
+build/test-iq-recorder: tests/test_iq_recorder.c src/iq_recorder.c src/iq_recorder.h src/platform.h src/version.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_iq_recorder.c src/iq_recorder.c -o $@ $(shell pkg-config --libs sdl2) -lm
+.PHONY: test-iq-recorder
+test-iq-recorder: build/test-iq-recorder
+	./build/test-iq-recorder
+test: test-iq-recorder
+
+build/atv-rx build/test-startup build/test-stack-worker build/bench-scatter: src/light_stack.h
+build/test-light-stack: tests/test_light_stack.c src/light_stack.c src/light_stack.h src/atv.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_light_stack.c src/light_stack.c -o $@
+.PHONY: test-light-stack
+test-light-stack: build/test-light-stack
+	./build/test-light-stack
+test: test-light-stack

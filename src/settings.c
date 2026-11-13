@@ -20,7 +20,7 @@ static const Field fields[]={
     C(line_hz,'d',15000,16250), C(rx_block,'z',2048,1048576), C(channel,'z',0,1),
     C(invert,'i',0,1), C(free_sync,'i',0,1), C(loop,'i',0,1),
     C(fm_mode,'i',0,1), C(video_deemphasis,'i',0,1), C(experimental_sync,'i',0,1),
-    I(stacking,0,1), I(stack_frames,1,512), I(rolling,0,1), I(paused,0,1),
+    I(stacking,0,1), I(stack_frames,1,512), I(rolling,0,1), I(paused,0,1), I(light_stacking,0,1),
     I(vertical_shift,-312,312), I(audio_source,0,3), I(audio_muted,0,1), I(audio_swap,0,1)
 };
 static const Field *field(const char *key)

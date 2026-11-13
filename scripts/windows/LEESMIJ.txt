@@ -20,7 +20,10 @@ Selecteer in Zadig alleen de HackRF.
 
 BEDIENING
 ! = toetsenuitleg, pijltjes omhoog/omlaag = gain, N = geluidsbron,
-A = dempen, P = screenshot, Esc = afsluiten.
+A = dempen, O = tv/oscilloscoop, P = screenshot, Q of Esc = afsluiten.
+S = stacking aan/uit; boven 10 MS/s: rolling 6 beelden in kleur, volledig tv-vlak.
+F9 = IQ-opname starten/stoppen; standaard 3 seconden, automatisch opslaan.
+De .cf32-opname en .cf32.json-instellingen staan in de huidige werkmap.
 Kies de geluidsuitgang in de wizard; 0 = Windows-standaarduitgang.
 Bij 10 MS/s is geen audio beschikbaar. FM 6 MHz en NICAM vereisen
 samplerate en video-IF van minstens 14 MHz; 7 MHz stereo minstens 16 MHz.

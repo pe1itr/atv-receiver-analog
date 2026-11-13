@@ -9,6 +9,9 @@
 #include "driver_status.h"
 #include "status_server.h"
 #include "video_quality.h"
+#include "video_scope.h"
+#include "iq_recorder.h"
+#include "light_stack.h"
 #include "clipping.h"
 #include <unistd.h>
 #include <SDL.h>
@@ -38,7 +41,7 @@ static int color_enabled(double rate, double bandwidth)
 typedef struct {
     uint32_t pixels[WIDTH*HEIGHT];
     uint32_t guide[WIDTH*HEIGHT];
-    int guided, synced;
+    int guided, synced, lightweight;
     int valid, phase, clear_pending;
     const char *reason;
     double period_x, period_y;
@@ -55,6 +58,9 @@ typedef struct {
     unsigned stack_epoch, stack_reset_id, stack_motion_id;
     uint64_t stack_skipped;
     int stacking, stack_paused, stack_hsync, sync_locked;
+    int light_stacking;
+    unsigned light_count;
+    uint64_t light_input_serial;
     unsigned stack_vsync;
     int stack_sync_input, stack_synced;
     uint32_t last_stacked;
@@ -82,6 +88,10 @@ typedef struct {
     double if_power_dbfs;
     VideoQualityReading quality;
     uint32_t quality_tick;
+    SDL_atomic_t scope_enabled, scope_epoch;
+    VideoScopeReading scope;
+    uint32_t scope_tick;
+    IQRecorder *recorder;
 } App;
 
 /* Only scalar diagnostics are copied; no image or IQ data enters the API. */
@@ -92,6 +102,7 @@ static int status_json(void *opaque,char *out,size_t capacity)
 #define B(x) ((x)?"true":"false")
 #define N(x) json_number(x)
     SDL_LockMutex(a->mutex);
+    int light_mode=a->c.rate>10e6 && !a->stacking;
     char hackrf_gains[160]="";
     if(!strcmp(a->c.mode,"hackrf"))
         snprintf(hackrf_gains,sizeof(hackrf_gains),",\"gain_control\":\"lna\",\"rx_lna_db\":%.12g,\"rx_vga_db\":%.12g,\"rf_amp_db\":14",a->actual_gain,a->c.hackrf_vga);
@@ -125,7 +136,7 @@ static int status_json(void *opaque,char *out,size_t capacity)
         "\"sync_depth\":%s,\"sync_depth_error\":%s,\"reason\":\"%s\","
         "\"lines\":%u,\"method\":\"pal_back_porch_sync_scaled_unweighted\"},"
         "\"afc\":{\"enabled\":%s,\"state\":%d,\"anchor_sdr_hz\":%.12g},"
-        "\"stack\":{\"enabled\":%s,\"paused\":%s,\"rolling\":%s,\"synced\":%s,"
+        "\"stack\":{\"enabled\":%s,\"paused\":%s,\"rolling\":%s,\"synced\":%s,\"lightweight\":%s,"
         "\"count\":%u,\"target\":%u,\"skipped\":%llu,\"confidence\":%.12g,\"dx\":%.12g,\"dy\":%.12g},"
         "\"audio\":{\"source\":%d,\"muted\":%s,\"locked\":%s,\"nicam_detected\":%s,\"nicam_locked\":%s,\"swap_lr\":%s,\"output_open\":%s,\"dsp_queued_samples\":%d,\"dsp_queue_overflows\":%d,"
         "\"nicam_good_frames\":%u,\"nicam_bad_frames\":%u,\"nicam_muted_frames\":%u,\"nicam_sync_bits_discarded\":%u,\"nicam_queue_overflows\":%u,"
@@ -146,8 +157,10 @@ static int status_json(void *opaque,char *out,size_t capacity)
         a->clipping.clipped_samples?SDL_GetTicks()-a->clipping.last_clip_tick:0,
         B(quality_valid),a->quality_tick?SDL_GetTicks()-a->quality_tick:0,snr,noise,depth,uncertainty,quality_reason,
         a->quality.lines,B(a->afc_enabled),a->afc_state,N(a->afc_anchor),
-        B(a->stacking),B(a->stack_paused),B(a->stack.rolling),B(a->stack_synced),a->stack.count,a->stack.target,
-        (unsigned long long)a->stack_skipped,N(a->stack.confidence),N(a->stack.dx),N(a->stack.dy),
+        B(a->stacking || a->light_stacking),B(!light_mode && a->stack_paused),
+        B(light_mode || a->stack.rolling),B(!light_mode && a->stack_synced),B(light_mode),
+        light_mode?a->light_count:a->stack.count,light_mode?LIGHT_STACK_FRAMES:a->stack.target,
+        (unsigned long long)a->stack_skipped,light_mode?0:N(a->stack.confidence),light_mode?0:N(a->stack.dx),light_mode?0:N(a->stack.dy),
         SDL_AtomicGet(&a->audio_source),B(SDL_AtomicGet(&a->audio_muted)),B(SDL_AtomicGet(&a->audio_locked)),
         B(SDL_AtomicGet(&a->nicam_detect)),B(SDL_AtomicGet(&a->nicam_lock)),
         B(SDL_AtomicGet(&a->audio_swap)),B(a->audio_device!=0),SDL_AtomicGet(&a->audio_dsp_queued),SDL_AtomicGet(&a->audio_dsp_overflows),
@@ -268,6 +281,11 @@ typedef struct {
     Config c;
     VideoQualityReading quality;
     uint32_t quality_tick;
+    VideoScopeReading scope;
+    uint32_t scope_tick;
+    int scope_enabled;
+    int light_stacking;
+    IQRecordStatus recording;
     uint32_t pixels[WIDTH*HEIGHT], live[WIDTH*HEIGHT], last_frame, last_stacked;
     float spectrum[FFT_SIZE], power;
     double actual_hz, actual_gain, if_bandwidth, line_hz, if_power_dbfs;
@@ -297,15 +315,23 @@ static void capture_view(App *a, View *v)
     memcpy(v->spectrum,a->spectrum,sizeof(v->spectrum));
 #define COPY_VIEW(name) v->name=a->name
     COPY_VIEW(quality); COPY_VIEW(quality_tick); COPY_VIEW(clipping);
+    COPY_VIEW(scope); COPY_VIEW(scope_tick);
+    v->scope_enabled=SDL_AtomicGet(&a->scope_enabled);
+    iq_recorder_status(a->recorder,&v->recording);
     COPY_VIEW(last_frame); COPY_VIEW(last_stacked); COPY_VIEW(power); COPY_VIEW(if_power_dbfs);
     COPY_VIEW(actual_hz); COPY_VIEW(actual_gain); COPY_VIEW(if_bandwidth); COPY_VIEW(line_hz);
     COPY_VIEW(frames); COPY_VIEW(overflows); COPY_VIEW(stack_skipped);
     COPY_VIEW(stacking); COPY_VIEW(stack_paused); COPY_VIEW(stack_synced);
+    COPY_VIEW(light_stacking);
     COPY_VIEW(afc_enabled); COPY_VIEW(afc_state); COPY_VIEW(afc_anchor);
     COPY_VIEW(fm_mode); COPY_VIEW(color_locked); COPY_VIEW(sync_locked); COPY_VIEW(free_sync);
     COPY_VIEW(stack.count); COPY_VIEW(stack.target); COPY_VIEW(stack.rolling);
     COPY_VIEW(stack.confidence); COPY_VIEW(stack.dx); COPY_VIEW(stack.dy);
     COPY_VIEW(stack.shear); COPY_VIEW(stack.status);
+    if(a->c.rate>10e6 && !a->stacking) {
+        v->stack.count=a->light_count; v->stack.target=LIGHT_STACK_FRAMES; v->stack.rolling=1;
+        v->stack_paused=0; v->stack_synced=0;
+    }
 #undef COPY_VIEW
     v->done=SDL_AtomicGet(&a->done);
     SDL_UnlockMutex(a->mutex);
@@ -317,6 +343,7 @@ static void reset_stack(App *a, unsigned target, int rolling)
     memset(&a->stack,0,sizeof(a->stack));
     a->stack.target=target; a->stack.rolling=rolling;
     a->stack_pending=0; a->last_stacked=0;
+    a->light_count=0;
     ++a->stack_epoch; ++a->stack_reset_id;
     SDL_CondBroadcast(a->stack_ready);
 }
@@ -326,12 +353,49 @@ static void interrupt_stack(App *a)
     a->stack_pending=0;
     SDL_CondBroadcast(a->stack_ready);
 }
+/* Called with the UI mutex held. S selects lightweight smoothing at high
+ * rates; explicitly requested offline contest stacks keep their controls. */
+static void stack_action(App *a,int action)
+{
+    if(!action) return;
+    if(a->c.rate>10e6 && !a->stacking) {
+        if(action!=1) return;
+        a->light_stacking=!a->light_stacking; a->stack_paused=0;
+        reset_stack(a,a->stack.target,a->stack.rolling);
+        memcpy(a->pixels,a->live,sizeof(a->pixels));
+        return;
+    }
+    if(stacking_limited(&a->c)) return;
+    unsigned target=a->stack.target;
+    if(action==1) { a->stacking=!a->stacking; a->stack_paused=0; }
+    if(action==5 && a->stacking) { a->stack_paused=!a->stack_paused; interrupt_stack(a); }
+    if(action==2 && target>1) --target;
+    if(action==3 && target<512) ++target;
+    if(action==1 || action==4 || action==6 || target<a->stack.count ||
+       (a->stack.rolling && target!=a->stack.target))
+        reset_stack(a,target,action==6?!a->stack.rolling:a->stack.rolling);
+    else if(a->stack.target!=target) { a->stack.target=target; ++a->stack_epoch; }
+    if(!a->stacking) memcpy(a->pixels,a->live,sizeof(a->pixels));
+}
+static void queue_light_frame(App *a,const uint32_t *pixels)
+{
+    if(!a->light_count) memcpy(a->pixels,pixels,sizeof(a->pixels));
+    if(a->command || SDL_AtomicGet(&a->failed)) return;
+    if(a->stack_pending) ++a->stack_skipped;
+    memcpy(a->queued.pixels,pixels,sizeof(a->queued.pixels));
+    a->queued.lightweight=1;
+    a->queued.serial=++a->light_input_serial;
+    a->stack_pending=1;
+    SDL_CondSignal(a->stack_ready);
+}
 static int stack_worker(void *opaque)
 {
     App *a=opaque;
     FrameStack *s=calloc(1,sizeof(*s));
     StackFrame *input=malloc(sizeof(*input));
     uint32_t *output=calloc(WIDTH*HEIGHT,sizeof(*output));
+    LightStack *light=NULL;
+    uint64_t light_serial=0;
     unsigned reset=0,motion=0;
     if(!s || !input || !output) { SDL_AtomicSet(&a->failed,1); goto cleanup; }
     for(;;) {
@@ -339,7 +403,10 @@ static int stack_worker(void *opaque)
         while(!a->stack_pending && !SDL_AtomicGet(&a->stop) && !SDL_AtomicGet(&a->done))
             SDL_CondWait(a->stack_ready,a->mutex);
         if(!a->stack_pending) { SDL_UnlockMutex(a->mutex); break; }
-        *input=a->queued;
+        if(a->queued.lightweight) {
+            memcpy(input->pixels,a->queued.pixels,sizeof(input->pixels));
+            input->lightweight=1; input->serial=a->queued.serial;
+        } else *input=a->queued;
         a->stack_pending=0; a->stack_busy=1;
         unsigned epoch=a->stack_epoch, next_reset=a->stack_reset_id, next_motion=a->stack_motion_id;
         unsigned target=a->stack.target;
@@ -348,23 +415,41 @@ static int stack_worker(void *opaque)
 
         /* Neither reception nor rendering holds this accumulator's lock. */
         int configured=1;
-        if(reset!=next_reset || !s->target) {
-            configured=stack_configure(s,target,rolling);
-            reset=next_reset;
-        } else s->target=target;
-        if(motion!=next_motion) { stack_discontinuity(s); motion=next_motion; }
-        s->period_x=input->period_x; s->period_y=input->period_y;
-        /* Keep motion fitting on the input field clock, even when pending
-         * stack frames were replaced while this worker was busy. */
-        s->seen=input->serial-1;
-        if(input->clear_pending) s->pending=0;
-        int added=configured && (input->synced ?
-            stack_add_synced(s,input->pixels,input->guided?input->guide:input->pixels,input->valid,input->phase,output) : input->guided ?
-            stack_add_guided(s,input->pixels,input->guide,input->valid,input->phase,output) :
-            stack_add(s,input->pixels,input->valid,input->phase,output));
+        int added=0;
+        if(input->lightweight) {
+            if(!light) {
+                light=malloc(sizeof(*light));
+                if(light) light_stack_reset(light);
+            }
+            configured=light!=NULL;
+            if(light) {
+                if(reset!=next_reset || motion!=next_motion ||
+                   (light_serial && input->serial!=light_serial+1)) light_stack_reset(light);
+                reset=next_reset; motion=next_motion; light_serial=input->serial;
+                light_stack_add(light,input->pixels,output); added=1;
+            }
+        } else {
+            if(reset!=next_reset || !s->target) {
+                configured=stack_configure(s,target,rolling);
+                reset=next_reset;
+            } else s->target=target;
+            if(motion!=next_motion) { stack_discontinuity(s); motion=next_motion; }
+            s->period_x=input->period_x; s->period_y=input->period_y;
+            /* Keep motion fitting on the input field clock, even when pending
+             * stack frames were replaced while this worker was busy. */
+            s->seen=input->serial-1;
+            if(input->clear_pending) s->pending=0;
+            added=configured && (input->synced ?
+                stack_add_synced(s,input->pixels,input->guided?input->guide:input->pixels,input->valid,input->phase,output) : input->guided ?
+                stack_add_guided(s,input->pixels,input->guide,input->valid,input->phase,output) :
+                stack_add(s,input->pixels,input->valid,input->phase,output));
+        }
 
         SDL_LockMutex(a->mutex);
-        if(epoch==a->stack_epoch && a->stacking && !a->stack_paused && !a->command) {
+        if(epoch==a->stack_epoch && a->light_stacking && input->lightweight && !a->command) {
+            a->light_count=light?light->count:0;
+            if(added) { memcpy(a->pixels,output,sizeof(a->pixels)); a->last_stacked=SDL_GetTicks(); }
+        } else if(epoch==a->stack_epoch && a->stacking && !input->lightweight && !a->stack_paused && !a->command) {
             a->stack.count=s->count; a->stack.accepted=s->accepted;
             a->stack.confidence=s->confidence;
             a->stack.status=input->reason ? input->reason : s->status;
@@ -380,7 +465,7 @@ static int stack_worker(void *opaque)
     }
 cleanup:
     if(s) stack_destroy(s);
-    free(s); free(input); free(output);
+    free(s); free(input); free(output); free(light);
     SDL_LockMutex(a->mutex);
     a->stack_busy=0; a->stack_pending=0;
     SDL_CondBroadcast(a->stack_ready);
@@ -392,7 +477,8 @@ static void live_frame(void *opaque, const uint32_t *pixels)
     App *a=opaque;
     SDL_LockMutex(a->mutex);
     memcpy(a->live,pixels,sizeof(a->live));
-    if(!a->stacking) memcpy(a->pixels,pixels,sizeof(a->pixels));
+    if(a->light_stacking) queue_light_frame(a,pixels);
+    else if(!a->stacking) memcpy(a->pixels,pixels,sizeof(a->pixels));
     SDL_UnlockMutex(a->mutex);
 }
 static void frame(void *opaque, const uint32_t *pixels)
@@ -435,10 +521,14 @@ static void frame(void *opaque, const uint32_t *pixels)
      * completeness guard (also rejects acquisition transients) and let the
      * stack's structure/match checks reject noise. */
     if(!valid && !a->stack.count) clear_pending=1;
-    if (!a->stacking) memcpy(a->pixels, a->live, sizeof(a->pixels));
+    if(a->light_stacking) {
+        if(!a->decoder->preview) queue_light_frame(a,a->live);
+    }
+    else if (!a->stacking) memcpy(a->pixels, a->live, sizeof(a->pixels));
     else if(!a->command && !a->stack_paused && !SDL_AtomicGet(&a->failed)) {
         if(a->stack_pending) ++a->stack_skipped;
         memcpy(a->queued.pixels,pixels,sizeof(a->queued.pixels));
+        a->queued.lightweight=0;
         /* Contest stacking remains luminance-only; the live image keeps RGB. */
         if(a->decoder->color) for(int k=0;k<WIDTH*HEIGHT;++k) {
             unsigned p=pixels[k];
@@ -700,6 +790,8 @@ static int worker(void *opaque)
     App *a = opaque;
     Playback audio={.app=a};
     VideoQuality quality; video_quality_init(&quality,a->c.rate);
+    VideoScope scope; video_scope_init(&scope,a->c.rate,a->c.line_hz);
+    int scope_epoch=-1;
     IQ *iq = malloc(a->c.rx_block * sizeof(*iq));
     Decoder *d = malloc(sizeof(*d));
     Decoder *preview = malloc(sizeof(*preview));
@@ -744,7 +836,7 @@ static int worker(void *opaque)
         reset_audio(&audio,video_path,a->c.if_bandwidth);
         fprintf(stderr,"Audio: 6 MHz mono / NICAM (rate and IF >= 14 MHz), 7.02/7.22 or 7.38/7.56 MHz stereo (>= 16 MHz); A mute, N source, Shift+N swap L/R\n");
     }
-    if(a->c.experimental_sync) fprintf(stderr,"Experimental sync: echo-resistant line timing and strongest field group enabled\n");
+    if(a->c.experimental_sync) fprintf(stderr,"Experimental sync: echo-resistant line timing enabled\n");
     if(a->c.video_deemphasis) fprintf(stderr,"Video de-emphasis: PAL ITU-R F.405-1, linear phase; raw FM/NICAM audio preserved\n");
     fprintf(stderr,"Video IF/FM: pipelined thread; PAL color automatic for IF >= 10 MHz at >= 12 MS/s\n");
     if(a->c.alignment_bandwidth>0) {
@@ -764,6 +856,7 @@ static int worker(void *opaque)
     while (!SDL_AtomicGet(&a->stop)) {
         SDL_LockMutex(a->mutex);
         if(a->info_paused) {
+            iq_recorder_finish(a->recorder,"paused");
             uint32_t pause_start=SDL_GetTicks();
             double pause_if=a->if_bandwidth;
             SDL_UnlockMutex(a->mutex);
@@ -796,6 +889,7 @@ static int worker(void *opaque)
             command&=~4;
         }
         if (command) {
+            iq_recorder_finish(a->recorder,"settings_changed");
             finish_video(d,video_path,alignment,&pending);
             afc_reset(&afc,a->c.rate,line_hz);
             if(!strcmp(a->c.mode,"sdrplay")) hz=fmin(2e9,fmax(1000,hz));
@@ -816,6 +910,8 @@ static int worker(void *opaque)
             SDL_UnlockMutex(a->mutex);
             video_quality_reset(&quality);
             publish_video_quality(a,&quality);
+            video_scope_reset(&scope,line_hz);
+            SDL_LockMutex(a->mutex); memset(&a->scope,0,sizeof(a->scope)); a->scope_tick=0; SDL_UnlockMutex(a->mutex);
             init_decoders(a,d,preview,invert,free_sync,line_hz,vertical_shift,if_bw);
             if(alignment) alignment_reset(alignment,invert);
             if (if_bw != applied_if) {
@@ -834,7 +930,10 @@ static int worker(void *opaque)
         int n = source_read(a->source, iq, a->c.rx_block);
         if(n<=0) finish_video(d,video_path,alignment,&pending);
         if (n == -2 || n == -3) {
+            iq_recorder_finish(a->recorder,"input_discontinuity");
             video_quality_reset(&quality); publish_video_quality(a,&quality);
+            video_scope_reset(&scope,line_hz);
+            SDL_LockMutex(a->mutex); memset(&a->scope,0,sizeof(a->scope)); a->scope_tick=0; SDL_UnlockMutex(a->mutex);
             if(recorded && record_count<record_capacity) {
                 record_count=0;
                 fprintf(stderr,"IQ recording: restarting after input discontinuity\n");
@@ -861,6 +960,7 @@ static int worker(void *opaque)
             continue;
         }
         clipping_process(&clipping,iq,(size_t)n,SDL_GetTicks());
+        iq_recorder_push(a->recorder,iq,(size_t)n);
         count += n;
         if(recorded && record_count<record_capacity) {
             size_t take=record_capacity-record_count;
@@ -909,6 +1009,17 @@ static int worker(void *opaque)
         pending=(size_t)n;
         if(ready) {
             uint64_t first_tick=d->tick;
+            if(SDL_AtomicGet(&a->scope_enabled)) {
+                int epoch_now=SDL_AtomicGet(&a->scope_epoch);
+                if(scope_epoch!=epoch_now) { video_scope_reset(&scope,line_hz); scope_epoch=epoch_now; }
+                if(video_scope_process(&scope,video,ready)) {
+                    SDL_LockMutex(a->mutex);
+                    if(SDL_AtomicGet(&a->scope_enabled) && SDL_AtomicGet(&a->scope_epoch)==epoch_now) {
+                        a->scope=scope.reading; a->scope_tick=SDL_GetTicks();
+                    }
+                    SDL_UnlockMutex(a->mutex);
+                }
+            }
             decoder_process_video(d,video,alignment?guide:NULL,ready);
             video_quality_process(&quality,video,ready,first_tick,quality_sync_valid(d),
                 d->free_origin,d->free_period>0?d->free_period:d->rate/d->line_hz,
@@ -942,6 +1053,7 @@ static int worker(void *opaque)
 fail:
     SDL_AtomicSet(&a->failed, 1);
 cleanup:
+    iq_recorder_finish(a->recorder,"end_of_input");
     source_stop(a->source);
     SourceStats rx_stats;
     source_get_stats(a->source,&rx_stats);
@@ -1181,6 +1293,83 @@ static SDL_AudioDeviceID open_audio_output(const char *name)
     else fprintf(stderr,"Audio unavailable (video continues): %s\n",SDL_GetError());
     return device;
 }
+static void draw_video_scope(SDL_Renderer *r,const View *v)
+{
+    const VideoScopeReading *s=&v->scope;
+    const int left=190,top=165,width=620,height=340;
+    char label[160];
+    SDL_SetRenderDrawColor(r,220,230,240,255);
+    snprintf(label,sizeof(label),"VIDEO OSCILLOSCOPE | O TV | 2 LINES %.1f US",2e6/v->line_hz);
+    text(r,140,85,label,2);
+    text(r,140,110,v->c.video_deemphasis?
+        "SIGNAL: VIDEO IF -> FM -> PAL DE-EMPHASIS":
+        "SIGNAL: VIDEO IF -> FM (DE-EMPHASIS OFF)",2);
+    text(r,140,137,"AMPLITUDE: FM UNITS / AUTO SCALE",1);
+    double range=fmax(.1,(double)s->maximum-s->minimum);
+    double minimum=s->minimum-range*.08,maximum=s->maximum+range*.08;
+    if(!s->sequence) { minimum=-1; maximum=1; }
+    double scale=height/(maximum-minimum);
+    for(int j=0;j<=4;++j) {
+        int y=top+j*height/4;
+        SDL_SetRenderDrawColor(r,45,55,66,255); SDL_RenderDrawLine(r,left,y,left+width,y);
+        SDL_SetRenderDrawColor(r,140,155,170,255);
+        snprintf(label,sizeof(label),"%+.2f",maximum-(maximum-minimum)*j/4);
+        text(r,125,y-5,label,1);
+    }
+    for(int j=0;j<=8;++j) {
+        int x=left+j*width/8;
+        SDL_SetRenderDrawColor(r,45,55,66,255); SDL_RenderDrawLine(r,x,top,x,top+height);
+        SDL_SetRenderDrawColor(r,140,155,170,255);
+        snprintf(label,sizeof(label),"%.1f",s->sequence?s->start_us+s->duration_us*j/8:2e6/v->line_hz*j/8);
+        text(r,x-12,top+height+12,label,1);
+    }
+    text(r,760,top+height+30,"TIME (US)",1);
+    if(s->sequence) {
+        if(s->triggered) {
+            int x=left+(int)(-s->start_us/s->duration_us*width);
+            SDL_SetRenderDrawColor(r,220,165,65,255); SDL_RenderDrawLine(r,x,top,x,top+height);
+        }
+        int stale=SDL_GetTicks()-v->scope_tick>500;
+        SDL_SetRenderDrawColor(r,stale?110:75,stale?125:220,stale?130:170,255);
+        int previous_x=0,previous_y=0;
+        for(int j=0;j<VIDEO_SCOPE_POINTS;++j) {
+            int x=left+j*width/(VIDEO_SCOPE_POINTS-1);
+            int upper=top+(int)((maximum-s->high[j])*scale);
+            int lower=top+(int)((maximum-s->low[j])*scale);
+            int middle=(upper+lower)/2;
+            SDL_RenderDrawLine(r,x,upper,x,lower);
+            if(j) SDL_RenderDrawLine(r,previous_x,previous_y,x,middle);
+            previous_x=x; previous_y=middle;
+        }
+        SDL_SetRenderDrawColor(r,220,230,240,255);
+        snprintf(label,sizeof(label),"%s%s",s->triggered?"SYNC PULSE TRIGGER":"FREE RUN - NO SYNC PULSE FOUND",stale?" | STALE":"");
+        text(r,140,550,label,2);
+    } else {
+        SDL_SetRenderDrawColor(r,220,230,240,255);
+        text(r,240,315,"WAITING FOR VIDEO SAMPLES",2);
+    }
+    SDL_SetRenderDrawColor(r,140,155,170,255);
+    text(r,140,580,"TRIGGER IS INDEPENDENT OF PAL LOCK | P SAVE SCOPE | O TV",1);
+}
+
+static void draw_iq_recording(SDL_Renderer *r,const IQRecordStatus *s,const char *warning)
+{
+    if(!warning && (s->state==IQ_REC_IDLE ||
+       ((s->state==IQ_REC_SAVED || s->state==IQ_REC_ERROR) && SDL_GetTicks()-s->updated>8000))) return;
+    SDL_Rect panel={120,571,720,34};
+    SDL_SetRenderDrawColor(r,24,34,46,255); SDL_RenderFillRect(r,&panel);
+    SDL_SetRenderDrawColor(r,235,180,100,255);
+    char label[160];
+    if(warning || s->state==IQ_REC_ERROR) snprintf(label,sizeof(label),"IQ RECORDING UNAVAILABLE");
+    else if(s->state==IQ_REC_PREPARING) snprintf(label,sizeof(label),"IQ PREPARING %.0f MB | F9 CANCEL",s->capacity*sizeof(IQ)/1e6);
+    else if(s->state==IQ_REC_CAPTURING) snprintf(label,sizeof(label),"IQ REC %.2f / %.2f S | F9 STOP",s->count/s->rate,s->capacity/s->rate);
+    else if(s->state==IQ_REC_SAVING) snprintf(label,sizeof(label),"IQ SAVING %.0f MB",s->count*sizeof(IQ)/1e6);
+    else snprintf(label,sizeof(label),"IQ SAVED %.2f S | %s",s->count/s->rate,s->reason);
+    text(r,130,576,label,2);
+    SDL_SetRenderDrawColor(r,220,230,240,255);
+    text(r,130,595,warning?warning:s->state==IQ_REC_ERROR?s->error:s->path,1);
+}
+
 static void draw_info_screen(SDL_Renderer *r, const Config *c)
 {
     static const struct { const char *key, *description; } commands[]={
@@ -1188,6 +1377,8 @@ static void draw_info_screen(SDL_Renderer *r, const Config *c)
         {"SHIFT / CTRL", "WHEN TUNING: 1 MHZ / 10 KHZ PER STEP"},
         {"UP / DOWN", "INCREASE / DECREASE RECEIVE GAIN BY 1 DB"},
         {"T", "ENTER FREQUENCY IN MHZ, INCLUDING CONVERTER LO"},
+        {"O", "SWITCH TV PICTURE / VIDEO OSCILLOSCOPE"},
+        {"F9", "START / STOP RAW IQ RECORDING (DEFAULT 3 SECONDS)"},
         {"ENTER / ESC", "DURING FREQUENCY ENTRY: TUNE / CANCEL"},
         {"BACKSPACE / CTRL+A", "DURING FREQUENCY ENTRY: DELETE CHARACTER / CLEAR FIELD"},
         {"W", "SAVE CURRENT SETTINGS AS STARTUP CONFIGURATION"},
@@ -1198,17 +1389,17 @@ static void draw_info_screen(SDL_Renderer *r, const Config *c)
         {"[ / ]", "DECREASE / INCREASE VIDEO IF BANDWIDTH BY 1 MHZ"},
         {", / .", "DECREASE / INCREASE LINE FREQUENCY BY 0.1 HZ"},
         {"B / V", "SHIFT VERTICAL IMAGE POSITION BY ONE STEP"},
-        {"S", "FRAME STACKING ON / OFF"},
+        {"S", "STACK ON / OFF; ABOVE 10 MS/S: ROLLING 6, FULL PICTURE"},
         {"- / +", "DECREASE / INCREASE NUMBER OF FIELDS TO STACK"},
         {"R", "RESTART STACK"},
         {"M", "SWITCH FIXED / ROLLING STACKING"},
         {"SHIFT+P", "PAUSE / RESUME STACKING"},
-        {"P", "SAVE SCREENSHOT AS PNG"},
+        {"P / CTRL+P", "PNG: 120 MS AVERAGE / SINGLE IMAGE"},
         {"A", "MUTE / UNMUTE AUDIO"},
         {"N", "AUDIO SOURCE: FM 6 / NICAM / 7.02+7.22 / 7.38+7.56 MHZ"},
         {"SHIFT+N", "SWAP LEFT AND RIGHT AUDIO CHANNELS"},
         {"SHIFT+1 / !", "OPEN THIS INFO SCREEN"},
-        {"ESC", "QUIT APPLICATION FROM THE MAIN SCREEN"},
+        {"Q / ESC", "QUIT APPLICATION FROM THE MAIN SCREEN"},
         {"MOUSE", "WHEEL: TUNE. CLICK SPECTRUM: SELECT FREQUENCY"}
     };
     SDL_SetRenderDrawColor(r,14,19,27,255); SDL_RenderClear(r);
@@ -1218,7 +1409,7 @@ static void draw_info_screen(SDL_Renderer *r, const Config *c)
     text(r,40,60,"VERSION " ATV_VERSION "   BUILT " ATV_BUILD_UTC " UTC",2);
     text(r,40,78,"PURPOSE: RECEIVE ANALOG FM AMATEUR TELEVISION WITH AN SDR.",2);
     SDL_SetRenderDrawColor(r,160,205,235,255);
-    text(r,40,104,"ATV CONTESTS: WEAK-SIGNAL FRAME STACKING AT <= 10 MS/S (LIVE SDR).",2);
+    text(r,40,104,"STACK: CONTEST AT <=10 MS/S; ABOVE 10 MS/S: LIGHT ROLLING 6, RGB.",2);
     text(r,40,126,"PAL COLOR: SAMPLE RATE >= 12 MS/S AND VIDEO IF >= 10 MHZ.",2);
     text(r,40,148,"NICAM DIGITAL AUDIO: SAMPLE RATE >= 14 MS/S AND VIDEO IF >= 14 MHZ.",2);
     SDL_SetRenderDrawColor(r,225,235,245,255);
@@ -1240,6 +1431,45 @@ static void draw_info_screen(SDL_Renderer *r, const Config *c)
     text(r,40,804,"FILE / DEMO: FRAME STACKING IS ALSO AVAILABLE ABOVE 10 MS/S.",2);
     SDL_SetRenderDrawColor(r,90,210,180,255);
     text(r,40,842,"PRESS ANY KEY TO RETURN",3);
+}
+
+/* Short exposure of the displayed live images, without registration or a sync
+ * requirement. Only distinct received fields count, not repeated UI redraws.
+ * This runs in the UI thread and never holds the reception mutex. */
+typedef struct {
+    uint32_t sum[WIDTH*HEIGHT][3], pixels[WIDTH*HEIGHT];
+    unsigned count, last_field;
+    uint32_t started;
+    double frequency, bandwidth;
+    int stacking, fm_mode;
+} ScreenshotExposure;
+
+static int screenshot_expose(ScreenshotExposure *s,const View *v,uint32_t now)
+{
+    if(s->count && (s->frequency!=v->actual_hz || s->bandwidth!=v->if_bandwidth ||
+       s->stacking!=v->stacking || s->fm_mode!=v->fm_mode))
+        memset(s,0,sizeof(*s));
+    if(!s->count) {
+        s->started=now; s->frequency=v->actual_hz; s->bandwidth=v->if_bandwidth;
+        s->stacking=v->stacking; s->fm_mode=v->fm_mode;
+    }
+    if(!s->count || s->last_field!=v->frames) {
+        const uint32_t *pixels=v->stacking?v->live:v->pixels;
+        for(size_t k=0;k<WIDTH*HEIGHT;++k) {
+            s->sum[k][0]+=(pixels[k]>>16)&255;
+            s->sum[k][1]+=(pixels[k]>>8)&255;
+            s->sum[k][2]+=pixels[k]&255;
+        }
+        s->last_field=v->frames; ++s->count;
+    }
+    if(now-s->started<120 && s->count<64) return 0;
+    for(size_t k=0;k<WIDTH*HEIGHT;++k) {
+        unsigned red=(s->sum[k][0]+s->count/2)/s->count;
+        unsigned green=(s->sum[k][1]+s->count/2)/s->count;
+        unsigned blue=(s->sum[k][2]+s->count/2)/s->count;
+        s->pixels[k]=0xff000000u|(red<<16)|(green<<8)|blue;
+    }
+    return 1;
 }
 
 /* Capture the completed backbuffer before SDL_RenderPresent. RGBA32 is
@@ -1315,10 +1545,10 @@ static void help(void)
          "  --video-deemphasis MODE PAL F.405-1 linear-phase correction: pal or off (default pal)\n"
          "  --if-bandwidth HZ      digital IF width (default 18000000); auto PAL color >= 10 MHz at >= 12 MS/s\n"
          "  --alignment-bandwidth HZ separate IF for sync/alignment (default 3200000; 0 = video IF)\n"
-         "  --stack-frames N       enable aligned stack of 1..512 fields (live SDR: rate <= 10 MS/s)\n"
+         "  --stack-frames N       aligned stack 1..512 fields (live >10 MS/s: light rolling 6)\n"
          "  --stack-rolling        continuously replace oldest accepted field\n"
          "  --free-sync            free-running live view; stack still follows sync\n"
-         "  --experimental-sync    experimental line and field sync together (default off)\n"
+         "  --experimental-sync    experimental echo-resistant line sync (default off)\n"
          "  --line-hz HZ           free-running line clock (default 15625)\n"
          "  --status-server        enable read-only HTTP JSON debug status (default off)\n"
          "  --no-status-server     disable status API, including a saved setting\n"
@@ -1328,15 +1558,17 @@ static void help(void)
          "  --invert               reverse FM video polarity\n"
          "  --snapshot PATH        save UI screenshot as BMP on exit\n"
          "  --record PATH          capture raw IQ in RAM, save native cf32 on exit (no overwrite)\n"
-         "  --record-seconds N     capture duration, default 3; maximum 15 s / 2 GiB\n"
+         "  --record-seconds N     CLI / F9 capture duration, default 3; maximum 15 s / 2 GiB\n"
          "  --seconds N            stop after N seconds (0 = unlimited)\n"
          "  --nicam                start with NICAM 6.552 MHz audio selected (N cycles audio sources)\n"
-         "  Audio: A mute; N select FM 6 MHz / NICAM / FM 7.02+7.22 / FM 7.38+7.56 MHz; Shift+N swap L/R.\n"
+    );
+    puts("Audio: A mute; N select FM 6 MHz / NICAM / FM 7.02+7.22 / FM 7.38+7.56 MHz; Shift+N swap L/R.\n"
          "Shift+1 (!) = application information and all controls; any key returns.\n"
          "Controls: left/right or wheel = 100 kHz, Shift = 1 MHz, Ctrl = 10 kHz;\n"
-         "C = AFC on/off (+/-500 kHz, live SDR); T = type frequency in MHz, Enter = tune, Esc = cancel; up/down = gain 1 dB; I = invert; click spectrum = tune; Esc = quit.\n"
-         "[ / ] = IF narrower/wider by 1 MHz; F = free sync; , / . = line clock -/+ 0.1 Hz; B/V = vertical position.\n"
-         "S = stacking on/off; -/+ = stack size; R = reset stack; M = fixed/rolling; P = PNG screenshot; Shift+P = pause/resume stacking (also clickable buttons).");
+         "C = AFC on/off (+/-500 kHz, live SDR); T = type frequency in MHz, Enter = tune, Esc = cancel; up/down = gain 1 dB; I = invert; click spectrum = tune; Q / Esc = quit.\n"
+         "[ / ] = IF narrower/wider by 1 MHz; O = TV / video oscilloscope; F = free sync; , / . = line clock -/+ 0.1 Hz; B/V = vertical position.\n"
+         "F9 = start/stop raw IQ recording with settings; auto-saves after --record-seconds (default 3).\n"
+         "S = stack on/off (above 10 MS/s: light RGB rolling 6, full picture); -/+ = contest stack size; R = reset; M = fixed/rolling; P = averaged PNG; Ctrl+P = single image; Shift+P = contest pause/resume.");
 }
 static double number(const char *s)
 {
@@ -1353,6 +1585,7 @@ static void current_settings(App *a, Settings *s)
     s->c.invert=a->invert; s->c.free_sync=a->free_sync;
     s->c.if_bandwidth=a->if_bandwidth; s->c.line_hz=a->line_hz;
     s->stacking=a->stacking; s->stack_frames=(int)a->stack.target;
+    s->light_stacking=a->light_stacking;
     s->rolling=a->stack.rolling; s->paused=a->stack_paused;
     s->vertical_shift=a->vertical_shift;
     s->audio_source=SDL_AtomicGet(&a->audio_source);
@@ -1397,6 +1630,7 @@ static int atv_main(int argc, char **argv)
     a->c=settings.c;
     int rolling=settings.rolling, explicit_nicam=0;
     a->stacking=settings.stacking; a->stack_paused=settings.paused;
+    a->light_stacking=settings.light_stacking;
     a->vertical_shift=settings.vertical_shift;
     SDL_AtomicSet(&a->audio_source,settings.audio_source);
     SDL_AtomicSet(&a->audio_muted,settings.audio_muted);
@@ -1414,7 +1648,7 @@ static int atv_main(int argc, char **argv)
         if (!strcmp(o,"--pluto")) { a->c.mode="pluto"; continue; }
         if (!strcmp(o,"--sdrplay")) { a->c.mode="sdrplay"; continue; }
         if (!strcmp(o,"--hackrf")) { a->c.mode="hackrf"; continue; }
-        if (!strcmp(o,"--stack-rolling")) { rolling=1; a->stacking=1; continue; }
+        if (!strcmp(o,"--stack-rolling")) { rolling=1; a->stacking=1; a->light_stacking=0; continue; }
         if (!strcmp(o,"--loop")) { a->c.loop=1; continue; }
         if (!strcmp(o,"--experimental-sync") || !strcmp(o,"--experimental-vsync") ||
             !strcmp(o,"--experimental-echo-sync")) { a->c.experimental_sync=1; continue; }
@@ -1468,7 +1702,7 @@ static int atv_main(int argc, char **argv)
         else if (!strcmp(o,"--stack-frames")) {
             double n = number(v);
             if (n < 1 || n > 512 || floor(n) != n) { free(a); return 2; }
-            stack_reset(&a->stack, (unsigned)n); a->stacking = 1;
+            stack_reset(&a->stack, (unsigned)n); a->stacking = 1; a->light_stacking=0;
         }
         else if (!strcmp(o,"--channel")) {
             double ch = number(v); if (ch < 0 || ch > 1 || floor(ch) != ch) { free(a); return 2; }
@@ -1525,9 +1759,12 @@ static int atv_main(int argc, char **argv)
         fprintf(stderr,"Separate sync/alignment IF: %.3f MHz; video IF: %.3f MHz\n",a->c.alignment_bandwidth/1e6,a->c.if_bandwidth/1e6);
     if (!a->source) { free(a); return 1; }
     if(stacking_limited(&a->c)) {
+        if(a->stacking) a->light_stacking=1;
         a->stacking=0;
-        fprintf(stderr,"Frame stacking disabled above 10 MS/s for live SDR (actual rate %.3f MS/s)\n",a->c.rate/1e6);
+        fprintf(stderr,"Live SDR %.3f MS/s: S toggles lightweight RGB rolling stack of 6 fields\n",a->c.rate/1e6);
     }
+    if(a->c.rate<=10e6) a->light_stacking=0;
+    if(a->light_stacking) { a->stacking=0; a->stack_paused=0; }
     if (init_ui()) { fprintf(stderr,"SDL: %s\n",SDL_GetError()); source_close(a->source); free(a); return 1; }
     if(a->c.rate>=14e6) {
         a->audio_device=open_audio_output(a->c.audio_output);
@@ -1538,6 +1775,7 @@ static int atv_main(int argc, char **argv)
     SDL_Texture *texture = r ? SDL_CreateTexture(r, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT) : NULL;
     SDL_Thread *thread = NULL, *stack_thread = NULL;
     View *view=malloc(sizeof(*view));
+    ScreenshotExposure *exposure=NULL;
     a->stack_ready=SDL_CreateCond();
     StatusServer *status_server=NULL;
     int result = 1;
@@ -1548,6 +1786,8 @@ static int atv_main(int argc, char **argv)
     a->fm_mode=a->c.fm_mode;
     a->if_bandwidth=a->c.if_bandwidth; a->line_hz=a->c.line_hz; a->free_sync=a->c.free_sync;
     for (int k=0;k<FFT_SIZE;++k) a->spectrum[k]=-120;
+    a->recorder=iq_recorder_create();
+    if(!a->recorder) fprintf(stderr,"F9 IQ recording unavailable: %s\n",SDL_GetError());
     reset_stack(a,a->stack.target,rolling);
     if(a->c.status_enabled) {
         status_server=status_server_open(a->c.status_bind,a->c.status_port);
@@ -1560,6 +1800,8 @@ static int atv_main(int argc, char **argv)
     uint32_t start = SDL_GetTicks();
     int screenshot_requested=0, save_result=0;
     uint32_t save_notice=0;
+    uint32_t record_notice=0;
+    const char *record_warning=NULL;
     FrequencyInput frequency_input={0};
     InfoScreen info_screen={0};
     uint32_t info_opened=0;
@@ -1584,7 +1826,8 @@ static int atv_main(int argc, char **argv)
             if(frequency_input_event(&frequency_input,a,&e)) continue;
             double delta=0, gain_delta=0;
             double step = SDL_GetModState() & KMOD_CTRL ? 1e4 : SDL_GetModState() & KMOD_SHIFT ? 1e6 : 1e5;
-            if (e.type == SDL_QUIT || (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE)) SDL_AtomicSet(&a->stop,1);
+            if (e.type == SDL_QUIT || (e.type == SDL_KEYDOWN &&
+                (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_q))) SDL_AtomicSet(&a->stop,1);
             if (e.type == SDL_MOUSEWHEEL) delta=e.wheel.y*step;
             if (e.type == SDL_KEYDOWN) {
                 if (e.key.keysym.sym==SDLK_LEFT) delta=-step;
@@ -1638,13 +1881,33 @@ static int atv_main(int argc, char **argv)
             int action = 0;
             if (e.type == SDL_KEYDOWN && !e.key.repeat) {
                 SDL_Keycode key = e.key.keysym.sym;
+                if(key==SDLK_F9) {
+                    record_notice=SDL_GetTicks();
+                    record_warning=a->c.record?"CLI --record is active; F9 recording is unavailable":
+                        !a->recorder?"Cannot start the IQ recorder worker":NULL;
+                    if(!record_warning) {
+                        IQRecordSettings recording={.c=a->c,.audio_source=SDL_AtomicGet(&a->audio_source),.vertical_shift=a->vertical_shift};
+                        recording.c.frequency=a->actual_hz; recording.c.gain=a->actual_gain;
+                        recording.c.if_bandwidth=a->if_bandwidth; recording.c.line_hz=a->line_hz;
+                        recording.c.fm_mode=a->fm_mode; recording.c.invert=a->invert; recording.c.free_sync=a->free_sync;
+                        iq_recorder_toggle(a->recorder,&recording);
+                    }
+                }
+                if(key==SDLK_o) {
+                    SDL_AtomicSet(&a->scope_enabled,!SDL_AtomicGet(&a->scope_enabled));
+                    SDL_AtomicAdd(&a->scope_epoch,1);
+                    memset(&a->scope,0,sizeof(a->scope)); a->scope_tick=0;
+                }
                 if (key == SDLK_s) action = 1;
                 if (key == SDLK_MINUS || key == SDLK_KP_MINUS) action = 2;
                 if (key == SDLK_EQUALS || key == SDLK_PLUS || key == SDLK_KP_PLUS) action = 3;
                 if (key == SDLK_r) action = 4;
                 if (key == SDLK_p) {
                     if(e.key.keysym.mod & KMOD_SHIFT) action=5;
-                    else screenshot_requested=1;
+                    else {
+                        screenshot_requested=(e.key.keysym.mod & KMOD_CTRL)?2:1;
+                        if(exposure) memset(exposure,0,sizeof(*exposure));
+                    }
                 }
                 if (key == SDLK_m) action = 6;
             }
@@ -1658,27 +1921,7 @@ static int atv_main(int argc, char **argv)
                 if (x >= 380 && x < 500) action = 5;
                 if (x >= 510 && x < 650) action = 6;
             }
-            if(action && stacking_limited(&a->c)) action=0;
-            if (action) {
-                unsigned target = a->stack.target;
-                if (action == 1) {
-                    a->stacking = !a->stacking; a->stack_paused = 0;
-                }
-                if (action == 5 && a->stacking) {
-                    a->stack_paused = !a->stack_paused; interrupt_stack(a);
-                }
-                if (action == 2 && target > 1) --target;
-                if (action == 3 && target < 512) ++target;
-                /* Increasing the target extends an existing acquisition. */
-                if (action == 1 || action == 4 || action == 6 || target < a->stack.count ||
-                    (a->stack.rolling && target!=a->stack.target)) {
-                    int mode=action==6?!a->stack.rolling:a->stack.rolling;
-                    reset_stack(a,target,mode);
-                    /* Retain the displayed image while awaiting new frames. */
-                } else if(a->stack.target!=target) {
-                    a->stack.target=target; ++a->stack_epoch;
-                }
-            }
+            stack_action(a,action);
             int save=e.type==SDL_KEYDOWN && e.key.keysym.sym==SDLK_w && !e.key.repeat;
             Settings snapshot={0};
             if(save) current_settings(a,&snapshot);
@@ -1698,16 +1941,29 @@ static int atv_main(int argc, char **argv)
         SDL_SetRenderDrawColor(r,14,19,27,255); SDL_RenderClear(r);
         capture_view(a,view);
         const View *v=view;
-        SDL_UpdateTexture(texture,NULL,v->pixels,WIDTH*sizeof(uint32_t));
-        SDL_Rect video=v->stacking ? (SDL_Rect){10,160,460,345} : (SDL_Rect){120,65,720,540};
-        SDL_RenderCopy(r,texture,NULL,&video);
-        if(v->stacking) {
-            SDL_UpdateTexture(texture,NULL,v->live,WIDTH*sizeof(uint32_t));
-            SDL_Rect live={490,160,460,345}; SDL_RenderCopy(r,texture,NULL,&live);
-            SDL_SetRenderDrawColor(r,220,230,240,255);
-            text(r,20,135,v->stack_paused ? "STACK PAUSED" :
-                v->stack.status ? v->stack.status : "SEEKING ALIGNMENT",2);
-            text(r,500,135,"LIVE",2);
+        int screenshot_ready=screenshot_requested==2 || (screenshot_requested && (v->scope_enabled || v->light_stacking));
+        if(screenshot_requested==1 && !v->scope_enabled && !v->light_stacking) {
+            if(!exposure) exposure=calloc(1,sizeof(*exposure));
+            if(!exposure) {
+                fprintf(stderr,"Screenshot: cannot allocate exposure buffer\n");
+                screenshot_requested=0;
+            } else screenshot_ready=screenshot_expose(exposure,v,SDL_GetTicks());
+        }
+        int averaged_photo=screenshot_ready && screenshot_requested==1 && !v->scope_enabled && !v->light_stacking;
+        const uint32_t *photo=averaged_photo?exposure->pixels:NULL;
+        if(v->scope_enabled) draw_video_scope(r,v);
+        else {
+            SDL_UpdateTexture(texture,NULL,photo && !v->stacking?photo:v->pixels,WIDTH*sizeof(uint32_t));
+            SDL_Rect video=v->stacking ? (SDL_Rect){10,160,460,345} : (SDL_Rect){120,65,720,540};
+            SDL_RenderCopy(r,texture,NULL,&video);
+            if(v->stacking) {
+                SDL_UpdateTexture(texture,NULL,photo?photo:v->live,WIDTH*sizeof(uint32_t));
+                SDL_Rect live={490,160,460,345}; SDL_RenderCopy(r,texture,NULL,&live);
+                SDL_SetRenderDrawColor(r,220,230,240,255);
+                text(r,20,135,v->stack_paused ? "STACK PAUSED" :
+                    v->stack.status ? v->stack.status : "SEEKING ALIGNMENT",2);
+                text(r,500,135,"LIVE",2);
+            }
         }
         SDL_SetRenderDrawColor(r,220,230,240,255);
         char buf[256];
@@ -1716,13 +1972,13 @@ static int atv_main(int argc, char **argv)
         int settings_x=20+(int)strlen(buf)*24+24;
         snprintf(buf,sizeof(buf),"%s %.0f DB   %.2f MS/S   BW %.2f MHZ",!strcmp(v->c.mode,"hackrf")?"LNA":"GAIN",v->actual_gain,v->c.rate/1e6,v->c.bandwidth/1e6);
         text(r,settings_x,15,buf,2);
-        text(r,settings_x,30,"T FREQUENCY MHZ   SHIFT+1 INFO",2);
+        text(r,settings_x,30,"T FREQUENCY MHZ  F9 RECORD  SHIFT+1 INFO",2);
         int locked=v->sync_locked && v->last_frame && SDL_GetTicks()-v->last_frame<150;
         snprintf(buf,sizeof(buf),"%s  %s  IF %.1f DBFS  FIELDS %u  DROPS %u",
             !strcmp(v->c.mode,"demo")?"DEMO":!strcmp(v->c.mode,"file")?(v->done?"FILE END":"FILE"):"LIVE",
             v->free_sync?"FREE SYNC":locked?"PAL SYNC":"SYNC SEEK",v->if_power_dbfs,v->frames,v->overflows);
         text(r,20,45,buf,2);
-        snprintf(buf,sizeof(buf),"IF %.2f MHZ [/]  ALIGN %.2f MHZ  FM%d [D]  F SYNC  LINE %.1f HZ ,/.  B/V",
+        snprintf(buf,sizeof(buf),"IF %.2f MHZ [/]  COLOR >=10 MHZ  ALIGN %.2f MHZ  FM%d [D]  F SYNC  LINE %.1f HZ ,/. B/V",
             v->if_bandwidth/1e6,(v->c.alignment_bandwidth>0?v->c.alignment_bandwidth:v->if_bandwidth)/1e6,v->fm_mode,v->line_hz);
         text(r,20,612,buf,2);
         for (int db=0;db>=-100;db-=20) {
@@ -1764,19 +2020,22 @@ static int atv_main(int argc, char **argv)
         text(r,758,36,buf,2);
 
         const SDL_Rect buttons[] = {{20,830,140,30},{170,830,40,30},{220,830,40,30},{270,830,100,30},{380,830,120,30},{510,830,140,30}};
-        const char *labels[] = {stacking_limited(&v->c) ? "STACK N/A" : v->stacking ? "STACK ON S" : "STACK OFF S", "-", "+", "RESET R", v->stack_paused ? "RESUME" : "PAUSE", v->stack.rolling ? "ROLLING M" : "FIXED M"};
+        int light_controls=v->c.rate>10e6 && !v->stacking;
+        const char *labels[] = {v->light_stacking?"STACK 6 ON S":v->stacking?"STACK ON S":"STACK OFF S",
+            light_controls?"N/A":"-",light_controls?"N/A":"+",light_controls?"N/A":"RESET R",
+            light_controls?"N/A":v->stack_paused?"RESUME":"PAUSE",light_controls?"ROLLING 6":v->stack.rolling?"ROLLING M":"FIXED M"};
         for (int k=0;k<6;++k) {
-            SDL_SetRenderDrawColor(r,45,65,80,255); SDL_RenderFillRect(r,&buttons[k]);
+            SDL_SetRenderDrawColor(r,light_controls && k>0?30:45,light_controls && k>0?40:65,light_controls && k>0?50:80,255); SDL_RenderFillRect(r,&buttons[k]);
             SDL_SetRenderDrawColor(r,220,230,240,255);
             text(r,buttons[k].x+8,840,labels[k],2);
         }
-        if(stacking_limited(&v->c)) {
+        if(light_controls) {
             SDL_SetRenderDrawColor(r,220,230,240,255);
-            text(r,20,866,"LIVE SDR: STACK DISABLED ABOVE 10 MS/S",2);
+            text(r,20,866,v->light_stacking?"LIGHT STACK: 6 ROLLING / RGB / S OFF":"S: LIGHT STACK / 6 ROLLING / RGB",2);
         }
         text(r,660,866,save_notice && SDL_GetTicks()-save_notice<5000 ?
             (save_result?"CONFIG SAVED":"SAVE FAILED: SEE TERMINAL"):"W SAVE SETTINGS",2);
-        const char *status = !v->stacking ? "OFF" : v->stack_paused ? "PAUSED" :
+        const char *status = !v->stacking && !v->light_stacking ? "OFF" : v->stack_paused ? "PAUSED" :
             !v->stack.rolling && v->stack.count >= v->stack.target ? "DONE" :
             v->last_stacked && SDL_GetTicks()-v->last_stacked < 200 ? "ADDING" : "HOLD";
         snprintf(buf,sizeof(buf),"FRAMES %u/%u  %s",v->stack.count,v->stack.target,status);
@@ -1789,8 +2048,13 @@ static int atv_main(int argc, char **argv)
         }
 
         if(color_enabled(v->c.rate,v->if_bandwidth))
-            text(r,20,803,v->color_locked?"PAL COLOR LOCK  /  I INVERT  F FREE SYNC":"PAL AUTO: SEEK BURST / MONO  /  I INVERT",2);
-        else text(r,20,803,"MONO / ARROWS TUNE/GAIN / I INVERT",2);
+            text(r,20,803,v->color_locked?
+                "PAL COLOR LOCK | IF >=10 MHZ, RATE >=12 MS/S":
+                "COLOR POSSIBLE | SEEK BURST | IF >=10 MHZ",2);
+        else if(v->c.rate<12e6)
+            text(r,20,803,"MONO: COLOR NEEDS >=12 MS/S AND IF >=10 MHZ",2);
+        else
+            text(r,20,803,"MONO: COLOR NEEDS IF >=10 MHZ (RATE >=12 MS/S)",2);
         int selected=SDL_AtomicGet(&a->audio_source);
         const char *audio_source=selected==3?"FM 7.38/7.56":selected==2?"FM 7.02/7.22":selected==1?"NICAM":"FM 6";
         if(v->c.rate<14e6)
@@ -1843,12 +2107,18 @@ static int atv_main(int argc, char **argv)
                 text(r,60,407,frequency_input.error,2);
             }
         }
-        if(screenshot_requested) {
+        draw_iq_recording(r,&v->recording,record_warning && SDL_GetTicks()-record_notice<8000?record_warning:NULL);
+        if(screenshot_ready) {
             char path[160];
+            if(photo) fprintf(stderr,"Screenshot exposure: %u distinct displayed fields over %u ms\n",
+                exposure->count,SDL_GetTicks()-exposure->started);
             save_window_png(r,v->actual_hz+v->c.lo,path,sizeof(path));
             screenshot_requested=0;
+            free(exposure); exposure=NULL;
         }
-        SDL_RenderPresent(r);
+        /* The averaged image is for the PNG only. Keep the last live image on
+         * screen during this one redraw; the next iteration presents live. */
+        if(!averaged_photo) SDL_RenderPresent(r);
         if (a->c.seconds>0 && (SDL_GetTicks()-start)/1000.0>=a->c.seconds) SDL_AtomicSet(&a->stop,1);
         SDL_Delay(16);
     }
@@ -1866,6 +2136,7 @@ static int atv_main(int argc, char **argv)
         if (surface) SDL_FreeSurface(surface);
     }
     if (a->stacking) fprintf(stderr,"Stacked fields: %u/%u\n",a->stack.count,a->stack.target);
+    if(a->light_stacking) fprintf(stderr,"Light rolling stack: %u/%u fields\n",a->light_count,LIGHT_STACK_FRAMES);
     if(a->stack.rolling) fprintf(stderr,"Rolling accepted fields: %llu\n",(unsigned long long)a->stack.accepted);
     fprintf(stderr,"Stack frames skipped: %llu\n",(unsigned long long)a->stack_skipped);
     fprintf(stderr,"Displayed fields: %u; stream discontinuities: %u\n",a->frames,a->overflows);
@@ -1879,7 +2150,9 @@ cleanup:
         if(stack_thread) SDL_WaitThread(stack_thread,NULL);
     }
     if (texture) SDL_DestroyTexture(texture);
+    iq_recorder_destroy(a->recorder);
     free(view);
+    free(exposure);
     if (r) { ui_text_destroy(r); SDL_DestroyRenderer(r); }
     if (window) SDL_DestroyWindow(window);
     if(a->stack_ready) SDL_DestroyCond(a->stack_ready);

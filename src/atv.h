@@ -74,6 +74,7 @@ typedef struct Decoder {
     double sample_time;
     double nominal_line_period, raster_period, raster_origin, raster_field_period;
     uint64_t raster_next_line, raster_field_ticks;
+    int raster_discard; /* Phase correction cleared this in-progress picture. */
     uint64_t hsync_pulses[512];
     unsigned hsync_count, hsync_updates;
     uint64_t hsync_field;
@@ -86,7 +87,7 @@ typedef struct Decoder {
     uint64_t vsync_bin_tick, vsync_peak, vsync_last, vsync_event, vsync_confirmed;
     unsigned vsync_samples, vsync_pos, vsync_filled, vsync_count;
     unsigned vsync_updates, vsync_epoch;
-    /* Experimental full-field candidate selection, independent of raster phase. */
+    /* Full-field candidate selection, independent of raster phase. */
     uint64_t vsync_scan_tick, vsync_scan_peak;
     double vsync_scan_best;
     uint32_t pixels[WIDTH * HEIGHT];
