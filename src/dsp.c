@@ -30,9 +30,12 @@ static void horizontal_clock(Decoder *d, double origin, double period)
         return;
     if(d->hsync_updates>=4 && d->fields-d->hsync_field<=3) {
         double error=remainder(origin-d->free_origin,d->free_period);
-        if(fabs(error)<d->rate*2e-6) {
-            origin=origin-error+.25*error;
-            period=d->free_period+.125*(period-d->free_period);
+        /* A weak field fit can move several microseconds without losing the
+         * line. Smooth that innovation too, and average its much noisier rate
+         * estimate over more fields so it cannot drive the raster sideways. */
+        if(fabs(error)<d->rate*8e-6) {
+            origin=origin-error+.2*error;
+            period=d->free_period+.02*(period-d->free_period);
         }
     }
     d->free_origin=origin;
@@ -41,10 +44,11 @@ static void horizontal_clock(Decoder *d, double origin, double period)
 }
 
 /* Weak FM often fragments individual pulses. Fold many lines, independently
- * in three parts of the field, and require the same negative sync trough. */
+ * in three parts of the field, and require independent negative sync troughs. */
 static void folded_horizontal(Decoder *d, double period)
 {
     double phase[3];
+    int usable[3];
     for(int part=0;part<3;++part) {
         double profile[128], score[128];
         for(int k=0;k<128;++k) {
@@ -71,21 +75,44 @@ static void folded_horizontal(Decoder *d, double period)
         double sides=0;
         for(int b=9;b<=17;++b)
             sides+=(profile[(best+b)%128]+profile[(best-b+128)%128])/18;
-        if(score[best]>-.035 || sides-score[best]<.06) return;
+        usable[part]=score[best]<=-.035 && sides-score[best]>=.04;
         double left=score[(best+127)%128], right=score[(best+1)%128];
         double curvature=left+right-2*score[best];
         double fraction=curvature>1e-9 ? .5*(left-right)/curvature : 0;
         phase[part]=(best+.5+fraction)*period/128-2.35e-6*d->rate;
-        if(part) phase[part]=phase[0]+remainder(phase[part]-phase[0],period);
     }
-    /* Reject unrelated minima and nonlinear phase changes in noise. */
-    if(fabs(phase[2]-2*phase[1]+phase[0])>period/64) return;
+    /* Dark picture content can obscure one region's trough. Require at least
+     * two independent regions, retaining the curvature check when all three
+     * are usable and the clock-rate bound for every fit. Unwrap around a usable
+     * region so a rejected minimum cannot split a trough at the phase wrap. */
+    int first=-1, last=-1, count=0;
+    double mean=0, position=0;
+    for(int part=0;part<3;++part) if(usable[part]) {
+        if(first<0) first=part;
+        phase[part]=phase[first]+remainder(phase[part]-phase[first],period);
+        last=part; ++count; mean+=phase[part]; position+=part;
+    }
+    if(count<2) return;
+    if(count==3 && fabs(phase[2]-2*phase[1]+phase[0])>period/64) return;
     double span=d->rate*.020/3;
-    double slope=(phase[2]-phase[0])/(2*span);
+    double slope=(phase[last]-phase[first])/((last-first)*span);
     double next_period=period/(1-slope);
     if(fabs(next_period/(d->rate/d->line_hz)-1)>=.002) return;
-    double at_end=(phase[0]+phase[1]+phase[2])/3+slope*d->rate*.010;
-    horizontal_clock(d,d->tick+remainder(at_end-d->tick,period)/(1-slope),next_period);
+    double at_end=mean/count+slope*span*(2.5-position/count);
+    double origin=d->tick+remainder(at_end-d->tick,period)/(1-slope);
+    if(!d->hsync_updates || d->fields-d->hsync_field>3) {
+        /* Two troughs alone can coincide in a single noise field. Acquisition
+         * needs three consecutive field fits predicting the same line clock. */
+        if(!d->hsync_confirmations || d->fields-d->hsync_candidate_field!=1 ||
+           fabs(remainder(origin-d->hsync_candidate_origin,d->hsync_candidate_period))>d->rate*3e-6 ||
+           fabs(next_period/d->hsync_candidate_period-1)>.0002)
+            d->hsync_confirmations=0;
+        d->hsync_candidate_origin=origin;
+        d->hsync_candidate_period=next_period;
+        d->hsync_candidate_field=d->fields;
+        if(++d->hsync_confirmations<3) return;
+    }
+    horizontal_clock(d,origin,next_period);
 }
 
 /* Recover horizontal phase and rate from a field's consensus of sync pulses.

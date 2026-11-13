@@ -44,8 +44,14 @@ static void burst(PalDecoder *p)
      * A fixed line-edge artefact rotates with the local oscillator instead
      * of maintaining the same phase two lines later, and averages away. */
     unsigned k=p->parity;
-    if(p->burst_count[k]<8) ++p->burst_count[k];
-    double alpha=1.0/p->burst_count[k];
+    if(p->burst_count[k]<24) ++p->burst_count[k];
+    /* Acquire with the short window so carrier error cannot average the
+     * burst away. Once locked, weak bursts benefit from longer integration.
+     * Strong bursts retain the fast loop and its colour phase response. */
+    int tracking=p->last_lock && p->tick-p->last_lock<p->rate*.002;
+    double coherent=p->burst_c[k]*p->burst_c[k]+p->burst_s[k]*p->burst_s[k];
+    unsigned window=tracking && coherent<.5*p->burst_power[k]?24:8;
+    double alpha=1.0/fmin(p->burst_count[k],window);
     p->burst_c[k]+=alpha*(c-p->burst_c[k]);
     p->burst_s[k]+=alpha*(s-p->burst_s[k]);
     p->burst_power[k]+=alpha*(c*c+s*s-p->burst_power[k]);
@@ -54,7 +60,7 @@ static void burst(PalDecoder *p)
     for(unsigned j=0;j<2;++j) {
         length[j]=hypot(p->burst_c[j],p->burst_s[j]);
         if(length[j]<.035 || length[j]>.3 ||
-           length[j]*length[j]<.3*p->burst_power[j]) goto seeking;
+           length[j]*length[j]<(tracking?.15:.3)*p->burst_power[j]) goto seeking;
     }
     c=p->burst_c[k]/length[k]; s=p->burst_s[k]/length[k];
     double other_c=p->burst_c[k^1]/length[k^1], other_s=p->burst_s[k^1]/length[k^1];
@@ -76,7 +82,9 @@ static void burst(PalDecoder *p)
     p->axis_c=ac/norm; p->axis_s=as/norm;
     p->polarity=p->axis_c*s-p->axis_s*c>0?1:-1;
     if(p->good<8) ++p->good;
-    p->locked=p->locked || p->good>=3;
+    /* Confirm acquisition before enabling the weaker tracking criterion;
+     * isolated noise coincidences must not start the long integration. */
+    p->locked=p->locked || p->good>=8;
     if(p->locked) p->last_lock=p->tick;
     ++p->burst_updates;
     p->have_burst=1;

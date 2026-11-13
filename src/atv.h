@@ -78,6 +78,10 @@ typedef struct Decoder {
     uint64_t hsync_pulses[512];
     unsigned hsync_count, hsync_updates;
     uint64_t hsync_field;
+    /* Independent field fits must agree before weak folded sync acquires. */
+    double hsync_candidate_origin, hsync_candidate_period;
+    uint64_t hsync_candidate_field;
+    unsigned hsync_confirmations;
     double hsync_sum[3][128];
     double fold_period, fold_phase;
     uint64_t fold_tick, vsync_bin_samples;

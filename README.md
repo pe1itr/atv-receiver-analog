@@ -119,8 +119,9 @@ is available in the Linux build, not in the current Windows package.
 | FM stereo at 7.02/7.22 or 7.38/7.56 MHz | 16 MS/s | 16 MHz |
 
 These limits enable the corresponding decoder; the transmission must contain
-the required color or audio information. **20 MS/s with 16 MHz video IF** is
-a starting point for color and audio. At 10 MS/s, audio decoding is disabled.
+the required color or audio information. For sources that sustain this rate,
+**20 MS/s with 16 MHz video IF** is a starting point for color and audio.
+See the measured Pluto Ethernet limits below. At 10 MS/s, audio decoding is disabled.
 
 For live weak-signal reception with stacking:
 
@@ -158,6 +159,44 @@ At 10 MS/s, 16-bit I/Q requires 40 MB/s before transport overhead; continuous
 operation depends on the connection. Lower sample rates reduce this load.
 Hardware and firmware determine the available frequency range. The receiver
 does not modify device firmware.
+
+#### Measured Pluto Ethernet performance
+
+Tests on 24–25 October 2026 used an OpenSourceSDRLab Zynq-7020/AD9363 board
+connected directly to a Linux laptop over a **1000 Mbit/s full-duplex Ethernet
+link**, with firmware `v0.38-4-g95aad-dirty`, libiio 0.25 on the board and
+libiio 0.26 on the laptop. These results describe this setup, not every Pluto
+variant or firmware version.
+
+Each complex sample occupies 4 bytes (16-bit I and 16-bit Q): 14 MS/s needs
+56 MB/s, and 20 MS/s needs 80 MB/s, before transport overhead. Raw IQ tests
+without the video/audio decoder reached approximately **15–16 MS/s over
+Ethernet**, versus 19.5 MS/s locally on the board at a configured 20 MS/s.
+Blocks up to 1048576 samples and additional kernel buffers did not reach
+20 MS/s. At 14 MS/s, a raw test delivered 13.98 MS/s including startup and
+shutdown. CPU profiling showed roughly 91% of one ARM core occupied by the
+busiest `iiod` thread, predominantly in kernel TCP transmission, network-buffer
+copying and the Ethernet driver. A gigabit link alone therefore does not
+guarantee continuous 20 MS/s IQ reception.
+
+The following settings produced working color video in the receiver:
+
+| Frequency | Sample rate | RF bandwidth | Video IF | Gain | RX block |
+| --- | --- | --- | --- | --- | --- |
+| 2370 MHz | 14 MS/s | 12 MHz | 13 MHz | 21 dB | 131072 samples |
+
+This test used `ip:192.168.3.2`, **FM0/D0**, 4 MHz deviation and PAL
+de-emphasis enabled. Two status snapshots 22 seconds apart both showed video
+sync and color lock, zero current queue latency, and zero discontinuities,
+discarded samples and reported hardware overflows. Estimated Video-SNR was
+12.70–12.77 dB. FM 6 MHz audio was selected, but the 13 MHz video IF is below
+the audio decoder's 14 MHz minimum; this is a working **video** configuration,
+not confirmation of decoded audio.
+
+Treat this as a starting point and check sustained sample throughput, sync
+and loss counters on your own system. Zero reported overflows alone do not
+prove sample continuity; the earlier 20 MS/s receiver tests also reported zero
+overflows while processing fewer samples per second than requested.
 
 ### HackRF
 
