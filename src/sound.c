@@ -83,6 +83,8 @@ void sound_process(void *opaque, const float *video, size_t n)
         else if(s->good) --s->good;
         if(s->good>=(unsigned)(intermediate*.020)) s->locked=1;
         if(!s->good) s->locked=0;
+        /* Monitoring needs carrier statistics, but no PCM filtering. */
+        if(!s->sink) continue;
         s->history[s->pos]=fm; s->pos=(s->pos+1)%TAPS;
         s->output_phase+=48000;
         if(s->output_phase<intermediate) continue;
@@ -121,11 +123,13 @@ Sound *sound_create(double rate, SoundOutput output, void *opaque)
     return create_channel(rate,6e6,160000,output,opaque);
 }
 struct StereoSound {
-    Sound *left, *right;
+    Sound *channels[4];
     SoundOutput sink;
     void *opaque;
     float left_pcm[256];
-    int swap;
+    int swap, upper_pair;
+    size_t monitor_position;
+    unsigned detected;
 };
 static void capture_left(void *opaque, const float *pcm, size_t n)
 {
@@ -153,34 +157,70 @@ StereoSound *stereo_sound_create(double rate, SoundOutput output, void *opaque)
     if(!s) return NULL;
     s->sink=output; s->opaque=opaque;
     /* Narrower filters separate the carriers spaced only 180-200 kHz apart. */
-    s->left=create_channel(rate,7.02e6,55000,capture_left,s);
-    s->right=create_channel(rate,7.22e6,55000,capture_right,s);
-    if(!s->left || !s->right) { stereo_sound_destroy(s); return NULL; }
+    const double carriers[]={7.02e6,7.22e6,7.38e6,7.56e6};
+    for(int k=0;k<4;++k) {
+        s->channels[k]=create_channel(rate,carriers[k],55000,NULL,s);
+        if(!s->channels[k]) { stereo_sound_destroy(s); return NULL; }
+    }
     return s;
 }
 void stereo_sound_reset(StereoSound *s, int upper_pair, int swap)
 {
     if(!s) return;
-    s->left->carrier=upper_pair?7.38e6:7.02e6;
-    s->right->carrier=upper_pair?7.56e6:7.22e6;
-    sound_reset(s->left); sound_reset(s->right); s->swap=!!swap;
+    for(int k=0;k<4;++k) sound_reset(s->channels[k]);
+    s->upper_pair=!!upper_pair; s->swap=!!swap;
+    s->monitor_position=0; s->detected=0;
 }
 void stereo_sound_process(StereoSound *s, const float *samples, size_t n)
 {
-    /* Identical channel clocks; each chunk emits at most one packet (<256
-     * frames), so the left packet is ready when the right callback runs. */
+    stereo_sound_monitor(s,samples,n,1);
+}
+void stereo_sound_monitor(StereoSound *s, const float *samples, size_t n, int playback)
+{
+    if(!s) return;
+    int pair=2*s->upper_pair;
+    for(int k=0;k<4;++k)
+        s->channels[k]->sink=playback && k==pair?capture_left:
+            playback && k==pair+1?capture_right:NULL;
+    /* Scan for 160 ms every two seconds. Hold the completed result between
+     * scans; the selected playback pair keeps running continuously. */
+    size_t window=(size_t)(s->channels[0]->rate*.160);
+    size_t interval=(size_t)(s->channels[0]->rate*2);
     while(n) {
+        int scanning=s->monitor_position<window;
+        if(!s->monitor_position) {
+            /* Discontinuous monitoring blocks need fresh filter/lock state.
+             * Leave audible channels untouched. */
+            for(int k=0;k<4;++k)
+                if(!playback || k/2!=s->upper_pair) sound_reset(s->channels[k]);
+        }
         size_t chunk=n<4096?n:4096;
-        sound_process(s->left,samples,chunk);
-        sound_process(s->right,samples,chunk);
+        size_t remaining=(scanning?window:interval)-s->monitor_position;
+        if(chunk>remaining) chunk=remaining;
+        /* Matching playback channel clocks; the left packet is ready before
+         * the right callback runs. Inactive channels do no PCM filtering. */
+        for(int k=0;k<4;++k)
+            if(scanning || (playback && k/2==s->upper_pair))
+                sound_process(s->channels[k],samples,chunk);
+        s->monitor_position+=chunk;
+        if(scanning && s->monitor_position==window) {
+            s->detected=0;
+            for(int k=0;k<4;++k)
+                if(sound_locked(s->channels[k])) s->detected|=1u<<k;
+        }
+        if(s->monitor_position==interval) s->monitor_position=0;
         samples+=chunk; n-=chunk;
     }
 }
 int stereo_sound_locked(const StereoSound *s)
 {
-    return s && sound_locked(s->left) && sound_locked(s->right);
+    return s && sound_locked(s->channels[2*s->upper_pair]) && sound_locked(s->channels[2*s->upper_pair+1]);
+}
+unsigned stereo_sound_detected(const StereoSound *s)
+{
+    return s?s->detected:0;
 }
 void stereo_sound_destroy(StereoSound *s)
 {
-    if(s) { sound_destroy(s->left); sound_destroy(s->right); free(s); }
+    if(s) { for(int k=0;k<4;++k) sound_destroy(s->channels[k]); free(s); }
 }

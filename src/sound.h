@@ -16,9 +16,14 @@ void sound_destroy(Sound *s);
 typedef struct StereoSound StereoSound;
 int stereo_sound_enabled(double rate, double bandwidth);
 StereoSound *stereo_sound_create(double rate, SoundOutput output, void *opaque);
-/* upper_pair: 0 = 7.02/7.22 MHz, 1 = 7.38/7.56 MHz. Resets both channels. */
+/* upper_pair: 0 = 7.02/7.22 MHz, 1 = 7.38/7.56 MHz. Resets all channels. */
 void stereo_sound_reset(StereoSound *s, int upper_pair, int swap);
 void stereo_sound_process(StereoSound *s, const float *samples, size_t n);
+/* Scan all carriers for 160 ms every 2 s; optionally play the selected pair
+ * continuously. Detection holds the last completed scan until the next one. */
+void stereo_sound_monitor(StereoSound *s, const float *samples, size_t n, int playback);
+/* Bits 0..3: 7.02, 7.22, 7.38, 7.56 MHz. Read while processing is idle. */
+unsigned stereo_sound_detected(const StereoSound *s);
 int stereo_sound_locked(const StereoSound *s);
 void stereo_sound_destroy(StereoSound *s);
 #endif
