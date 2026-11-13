@@ -1,14 +1,16 @@
 # Installeren en compileren
 
-Deze handleiding beschrijft de huidige bouwroute op **Fedora 43**: een native
-Linux-build en een Windows x64-cross-build met MinGW-w64. Voer de commando's
+De Linux-ontvanger kan worden gecompileerd op **Debian, Ubuntu, Linux Mint
+(ook LMDE) en Fedora**. Je hoeft hiervoor niet van distributie te wisselen.
+De Windows x64-cross-build met MinGW-w64 gebruikt specifiek Fedora.
+Voer de commando's
 uit in de hoofdmap van de broncode, waar `Makefile` staat. Download en pak
 hiervoor de broncode uit of gebruik een Git-checkout van de gewenste versie.
 Voor een Windows-release gebruik je de broncode van de bijbehorende release-tag.
 
-De pakketnamen hieronder zijn afgestemd op Fedora. Andere Linux-distributies
-kunnen de C-code ook bouwen met equivalente ontwikkelpakketten; de
-Windows-verpakkingsscripts gebruiken specifiek Fedora-paden en RPM-pakketten.
+Kies hieronder de pakketcommando's voor jouw distributie. De native Linux-build
+gebruikt `pkg-config`, zodat ook de librarypaden van Debian/Ubuntu/Mint worden
+gevonden. De Windows-verpakkingsscripts gebruiken Fedora-paden en RPM-pakketten.
 
 ## Windows gebruiken zonder compileren
 
@@ -27,6 +29,20 @@ SDRplay vereist extra installatie; zie de [README](README.md#sdrplay-rsp1b-exper
 
 ### 1. Ontwikkelpakketten installeren
 
+Open een terminal in de uitgepakte bronmap met `Makefile`.
+Gebruik uitsluitend het blok voor jouw distributie.
+
+**Debian / Ubuntu / Linux Mint / LMDE:**
+
+```sh
+sudo apt update
+sudo apt install build-essential pkg-config \
+  libsdl2-dev libfftw3-dev libsoapysdr-dev libuhd-dev \
+  libpng-dev libfreetype6-dev libfontconfig1-dev fonts-dejavu-core
+```
+
+**Fedora** (pakketnamen gecontroleerd op Fedora 43):
+
 ```sh
 sudo dnf install gcc make pkgconf-pkg-config python3 \
   sdl2-compat-devel fftw-devel SoapySDR-devel uhd-devel \
@@ -37,9 +53,18 @@ sudo dnf install gcc make pkgconf-pkg-config python3 \
 Fedora 43 levert de SDL2-API via `sdl2-compat-devel`. De applicatie gebruikt
 SDL2, geen rechtstreeks op SDL3 gerichte API. UHD en SoapySDR zijn in de
 huidige Linux-Makefile verplichte bouwdependencies, ook voor gebruik met de demo.
-Python 3 is nodig voor de integratietests.
+Python 3 is nodig voor de optionele lokale integratietests en de statusclient,
+maar niet om de Linux-ontvanger te compileren. Installeer het zo nodig met
+`sudo apt install python3` of `sudo dnf install python3`.
 
-Voor optionele PlutoSDR-ondersteuning:
+Voor optionele **PlutoSDR-ondersteuning**, op Debian/Ubuntu/Mint/LMDE:
+
+```sh
+sudo apt install libiio-dev
+pkg-config --modversion libiio
+```
+
+Op Fedora:
 
 ```sh
 sudo dnf install libiio-devel
@@ -48,6 +73,11 @@ pkg-config --modversion libiio
 
 De code gebruikt **libiio >= 0.23 en < 1.0**. De Makefile detecteert die
 versiereeks automatisch; met libiio 1.x wordt Pluto-ondersteuning niet gebouwd.
+Ter referentie: de officiële pakketlijsten vermelden libiio 0.26 voor
+[Debian 13](https://packages.debian.org/trixie/libiio-dev) en 0.25 voor
+[Ubuntu 24.04](https://packages.ubuntu.com/noble/libiio-dev). Controleer altijd
+de werkelijk geïnstalleerde versie; andere releases of eigen repositories
+kunnen een andere versie leveren.
 
 Controleer de verplichte dependencies:
 
@@ -55,12 +85,16 @@ Controleer de verplichte dependencies:
 pkg-config --modversion sdl2 fftw3f SoapySDR uhd libpng freetype2 fontconfig
 ```
 
-Bij een ontbrekend pakket eerst de installatie of `PKG_CONFIG_PATH` corrigeren.
+Of voer `make check-deps` uit: dat controleert de dependencies en toont bij
+ontbrekende pakketten het installatiecommando voor jouw distributie.
+Ontbrekende of ongeschikte libiio geeft een waarschuwing; andere ontbrekende
+bouwdependencies stoppen de build. `HAVE_LIBIIO=1` met een ongeschikte libiio
+stopt ook, zodat Pluto-ondersteuning niet ongemerkt ontbreekt.
 
 ### 2. Compileren en starten
 
 ```sh
-make -j2 all
+bash scripts/build-linux.sh
 ./build/atv-rx --version
 ./build/atv-rx --no-config --no-wizard --demo
 ```
@@ -76,6 +110,12 @@ optioneel en worden afzonderlijk gebouwd met `make tools`:
 
 De demo heeft geen aangesloten SDR nodig. Sluit het venster met **Esc**.
 Start daarna `./build/atv-rx` voor de configuratiewizard en live ontvangst.
+
+Het bouwscript controleert eerst de ontwikkelpakketten, toont waarschuwingen
+en fouten en bewaart de uitvoer in `build/linux-build.log`. Bij een fout stopt
+het met een verwijzing naar dat log en deze handleiding. Het installeert niets
+automatisch. Direct `make -j2 all` gebruiken kan ook; de dependencycontrole
+wordt dan eveneens uitgevoerd. Bouw zonder `sudo`.
 
 Na het toevoegen van libiio, of bij gewijzigde bouwopties, forceer je een
 nieuwe compilatie. Alleen `make` detecteert niet alle wijzigingen in de
@@ -121,6 +161,7 @@ make bench
   SoapySDR-installatie en de bijbehorende USB-toegang/udev-regels.
   Controleer de detectie met `SoapySDRUtil --find="driver=hackrf"` als dit
   hulpprogramma is geïnstalleerd. De Linux-Makefile bouwt de module niet zelf.
+  Op Debian/Ubuntu/Mint/LMDE: `sudo apt install soapysdr-tools soapysdr-module-hackrf hackrf`.
 - **PlutoSDR:** bouw met de ondersteunde libiio-versie en configureer USB-toegang
   of een netwerk-URI. Zie de [Pluto-instructies](README.md#plutosdr--ad9361).
 - **B210:** geef de passende firmware-/FPGA-map op met
@@ -147,6 +188,9 @@ Dit is een **cross-build op Linux**. De repository bevat geen afzonderlijke
 bouwroute voor MSVC of compileren vanuit een Windows-opdrachtprompt.
 De scripts downloaden vastgelegde bron-/SDL-pakketten en controleren hun
 SHA-256-checksums. Voor de eerste build is internettoegang nodig.
+De bouwroute controleert vóór het downloaden de Fedora-paden, gereedschappen,
+verpakkingspakketten en Python-versie. Een fout meldt de bouwfase en verwijst
+naar deze instructies. Compilerwaarschuwingen blijven zichtbaar in de terminal.
 
 ### 1. Bouw- en verpakkingsdependencies installeren
 
@@ -215,12 +259,40 @@ De instellingen en het log staan in `%APPDATA%\PE1ITR\ATV Receiver\`.
 
 ## Veelvoorkomende bouwproblemen
 
+- **`make: command not found`, `cc: command not found` of `pkg-config` ontbreekt:**
+  voer het volledige installatieblok voor jouw distributie uit bij stap 1.
+- **`Unable to locate package` bij `apt`:** voer eerst `sudo apt update` uit.
+  Controleer in Softwarebronnen of de officiële pakketbronnen voor jouw versie
+  actief zijn. Ubuntu heeft voor onder andere SoapySDR de component `universe`
+  nodig: activeer die zo nodig met `sudo add-apt-repository universe`, gevolgd
+  door `sudo apt update`. Op Mint/LMDE beheer je de bronnen via Softwarebronnen;
+  voeg geen Ubuntu-bronnen toe aan Debian of LMDE. Gebruik pakketnamen uit het
+  juiste blok: Fedora's `*-devel`-namen werken niet bij `apt`.
+  De officiële [Ubuntu-pakketpagina](https://packages.ubuntu.com/noble/libsoapysdr-dev)
+  vermeldt welke repositorycomponent het pakket levert.
 - **`Package ... was not found`:** controleer de ontwikkelpakketten en het
-  resultaat van `pkg-config --modversion` hierboven.
+  resultaat van `make check-deps`. Alleen de runtime-library installeren is
+  onvoldoende: de `-dev`- of `-devel`-pakketten leveren headers en `.pc`-bestanden.
+  Bij een eigen installatieprefix moet `PKG_CONFIG_PATH` naar de bijbehorende
+  `lib/pkgconfig`-map wijzen; stel geen Fedora- of Windows-librarypaden in op
+  Debian/Ubuntu/Mint.
+- **Compiler- of linkerfout na een geslaagde dependencycontrole:** zoek de eerste
+  fout in `build/linux-build.log`; latere fouten kunnen daarvan het gevolg zijn.
+  Na installatie van ontbrekende pakketten: `bash scripts/build-linux.sh -B`.
+  Vermeld bij een hulpvraag je distributie/versie (`cat /etc/os-release`) en die
+  eerste fout met de omliggende regels. Deel geen oud uitvoerbaar bestand als
+  bewijs dat de nieuwe compilatie gelukt is.
+- **`Killed` of geheugen tekort tijdens compilatie:** probeer `bash scripts/build-linux.sh -j1`.
+- **De demo werkt, maar de SDR wordt niet gevonden:** controleer de aparte
+  hardwaremodule, USB-toegang en de hardware-instructies hierboven. Compileren
+  installeert geen USB-regels of SDRplay-API.
 - **Pluto-driver ontbreekt:** controleer de libiio-versie en bouw opnieuw met
   `make -B all` nadat libiio >= 0.23 en < 1.0 is geïnstalleerd.
 - **Windows-verpakking mist een font of licentiebestand:** controleer of alle
   genoemde Fedora-pakketten zijn geïnstalleerd. Het script gebruikt hun vaste paden.
+  `make windows` is geen native Linux-build voor Debian/Ubuntu/Mint; gebruik daar
+  `bash scripts/build-linux.sh`. Voor een Windows-pakket gebruik je de beschreven
+  Fedora-bouwomgeving of de kant-en-klare release-ZIP.
 - **Nieuwe code lijkt niet actief:** start het zojuist gebouwde bestand en
   controleer `--version`; een eerder naar `~/.local/bin` gekopieerd bestand
   wordt niet automatisch bijgewerkt door `make`.

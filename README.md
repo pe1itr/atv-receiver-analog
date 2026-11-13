@@ -50,40 +50,79 @@ IQ recordings.
 
 ### Linux
 
+**You can build the Linux receiver on Debian, Ubuntu and Linux Mint, as well as
+Fedora.** Linux Mint users should follow the Debian/Ubuntu/Mint commands below
+(also for LMDE). You do not need to install Fedora.
+
 The native build requires a C11 compiler, make, pkg-config, SDL2, single-precision
 FFTW3, UHD, SoapySDR, libpng, FreeType and Fontconfig development packages.
 UHD and SoapySDR are required by the Linux build even when using the demo.
 
-On Fedora 43:
+**Step 1 — install the packages for your distribution.** Open a terminal in
+the extracted source directory (the folder containing `Makefile`). Copy the
+commands for your distribution only.
+
+Debian / Ubuntu / Linux Mint / LMDE:
+
+```sh
+sudo apt update
+sudo apt install build-essential pkg-config \
+  libsdl2-dev libfftw3-dev libsoapysdr-dev libuhd-dev \
+  libpng-dev libfreetype6-dev libfontconfig1-dev fonts-dejavu-core
+```
+
+Fedora (package names checked on Fedora 43):
 
 ```sh
 sudo dnf install gcc make pkgconf-pkg-config \
   sdl2-compat-devel fftw-devel SoapySDR-devel uhd-devel \
   libpng-devel freetype-devel fontconfig-devel \
   google-noto-sans-mono-vf-fonts
-make -j2
+```
+
+**Step 2 — build and try the demo** (the same commands on all these distributions):
+
+```sh
+bash scripts/build-linux.sh
 ./build/atv-rx --no-config --no-wizard --demo
 ```
 
-`make` builds only `build/atv-rx`. Run it without arguments to open the startup
-wizard. The demo needs no SDR and does not transmit anything.
+The build checks for missing packages first, shows installation advice and
+saves compiler output to `build/linux-build.log`. It never installs packages
+automatically. If it reports an error, follow its instructions before starting
+the receiver. Warnings are shown too; missing optional PlutoSDR support does
+not prevent using another SDR. To check dependencies without compiling, run
+`make check-deps`.
+
+The demo needs no SDR and does not transmit anything. Close it with **Esc**.
+Then run `./build/atv-rx` to open the startup wizard for your SDR.
+`make -j2 all` remains available for a direct build and also checks dependencies.
 
 PlutoSDR support is optional and requires **libiio >= 0.23 and < 1.0**:
 
 ```sh
-sudo dnf install libiio-devel
+sudo apt install libiio-dev
 pkg-config --modversion libiio
-make -B -j2
+bash scripts/build-linux.sh -B
 ```
 
+On Fedora, use `sudo dnf install libiio-devel` instead of the `apt` command.
 The Makefile detects this libiio version range automatically. libiio 1.x is
 not supported by this driver. Use `make -B HAVE_LIBIIO=0` to disable Pluto
 support explicitly. Rebuild with `make -B` after changing dependencies or
 compiler options.
 
-HackRF also needs the SoapyHackRF module and USB access permissions. Other
-Linux distributions need equivalent development packages. The detailed
-[installation guide](INSTALL.md) is currently in Dutch.
+For HackRF on Debian/Ubuntu/Mint, also run:
+
+```sh
+sudo apt install soapysdr-tools soapysdr-module-hackrf hackrf
+SoapySDRUtil --find="driver=hackrf"
+```
+
+Hardware drivers and USB access permissions are separate from compilation.
+If `apt` cannot find a package, or you get a compiler/driver error, follow
+the troubleshooting steps in the detailed
+[installation guide](INSTALL.md) (currently in Dutch).
 
 There is no `make install` target. To install the executable for your user:
 

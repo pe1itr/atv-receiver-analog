@@ -1,20 +1,25 @@
 CC ?= cc
+PKG_CONFIG ?= pkg-config
 PKGS = sdl2 fftw3f SoapySDR uhd libpng freetype2 fontconfig
 # Match datv-transmitter: optional legacy libiio API. Override HAVE_LIBIIO=0 to disable.
-HAVE_LIBIIO ?= $(shell pkg-config --exists 'libiio >= 0.23' 'libiio < 1.0' && echo 1)
+HAVE_LIBIIO ?= $(shell $(PKG_CONFIG) --exists 'libiio >= 0.23' 'libiio < 1.0' 2>/dev/null && echo 1)
 ifeq ($(HAVE_LIBIIO),1)
 PKGS += libiio
 CPPFLAGS += -DHAVE_LIBIIO
 endif
-CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Isrc $(shell pkg-config --cflags $(PKGS))
+CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Isrc $(shell $(PKG_CONFIG) --cflags $(PKGS) 2>/dev/null)
 CFLAGS ?= -O3 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -fno-math-errno
 RX_BUILD_FLAGS = -DATV_BUILD_UTC='"$(shell date -u +%Y-%m-%dT%H:%M:%SZ)"'
 NICAM_SRC = src/nicam.c src/nicam_core/core.c
 NICAM_DEPS = src/nicam.h $(wildcard src/nicam_core/*)
-LDLIBS += $(shell pkg-config --libs $(PKGS)) -lm -pthread
+LDLIBS += $(shell $(PKG_CONFIG) --libs $(PKGS) 2>/dev/null) -lm -pthread
 .PHONY: all tools test bench clean
 all: build/atv-rx
+.PHONY: check-deps
+check-deps:
+	@CC='$(CC)' PKG_CONFIG='$(PKG_CONFIG)' HAVE_LIBIIO='$(HAVE_LIBIIO)' bash scripts/check-build-deps.sh
+build/atv-rx build/atv-eval: | check-deps
 tools: build/atv-tx build/atv-eval
 build:
 	mkdir -p $@
