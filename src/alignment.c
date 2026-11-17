@@ -1,4 +1,6 @@
 #include "alignment.h"
+#include "iq_dc_block.h"
+#include "iq_power.h"
 #include <SDL.h>
 #include <math.h>
 #include <stdlib.h>
@@ -17,6 +19,8 @@ struct Alignment {
     uint32_t power_tick;
     uint64_t power_countdown;
     int busy, stop, video_mode, fm_mode;
+    int dc_block_enabled;
+    IQDCBlock dc_block;
     void (*consume)(void *, const float *, size_t);
     void *consumer;
 };
@@ -30,18 +34,19 @@ static int run(void *opaque)
         SDL_UnlockMutex(a->mutex);
         if_filter_process(a->filter,a->iq,a->n);
         /* Sample one block about 25 times/s, only on the video branch.
-         * Measure complex power before FM removes amplitude information. */
+         * Measure AC power before FM removes amplitude information. Exclude
+         * DC regardless of whether the FM path's DC blocker is enabled. */
         if(a->video_mode && a->n) {
             if(!a->power_countdown) {
-                double power=0;
-                for(size_t j=0;j<a->n;++j)
-                    power+=(double)a->iq[j].i*a->iq[j].i+(double)a->iq[j].q*a->iq[j].q;
-                a->if_power_dbfs=10*log10(power/a->n+1e-16);
+                a->if_power_dbfs=iq_ac_power_dbfs(a->iq,a->n);
                 a->power_tick=SDL_GetTicks();
                 a->power_countdown=(uint64_t)(a->rate/25);
             }
             a->power_countdown=a->power_countdown>a->n?a->power_countdown-a->n:0;
         }
+        /* FM correction is independent of the DC-excluding power estimate.
+         * Raw clipping and recordings are unaffected by this DSP step. */
+        if(a->dc_block_enabled) iq_dc_block_process(&a->dc_block,a->iq,a->n);
         fm_demod_process(&a->demod,a->iq,a->video,a->n);
         if(a->consume) a->consume(a->consumer,a->video,a->n);
         if(a->deemphasis) video_deemphasis_process(a->deemphasis,a->video,a->n);
@@ -85,10 +90,17 @@ void alignment_reset(Alignment *a, int invert)
     a->if_power_dbfs=NAN; a->power_countdown=0; a->power_tick=0;
     if_filter_reset(a->filter);
     if(a->deemphasis) if_filter_reset(a->deemphasis);
+    iq_dc_block_reset(&a->dc_block,a->rate);
     unsigned stride=(a->video_mode || a->fm_mode)?1:(unsigned)fmax(1,floor(a->rate/fmax(4e6,2*a->bandwidth)));
     fm_demod_init(&a->demod,a->rate,a->deviation,invert,stride);
     a->demod.mode=a->fm_mode;
     if(a->video_mode==2) a->demod.alpha=1;
+}
+void alignment_set_dc_block(Alignment *a,int enabled)
+{
+    alignment_wait(a);
+    a->dc_block_enabled=enabled!=0;
+    iq_dc_block_reset(&a->dc_block,a->rate);
 }
 void alignment_set_fm_mode(Alignment *a, int mode, int invert)
 {

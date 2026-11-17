@@ -9,7 +9,8 @@ Alignment *alignment_create_video(double rate, double bandwidth, double deviatio
  * wait returns the held demodulated guide, valid until the next submit/reset. */
 int alignment_submit(Alignment *a, const IQ *iq, size_t n);
 const float *alignment_wait(Alignment *a);
-/* IQ power after the bandwidth filter, before FM; NaN until first measurement.
+/* IQ power after the bandwidth filter, excluding DC, before FM;
+ * NaN until first measurement. Independent of the FM DC-blocker setting.
  * Same single caller as submit/wait; waits for the outstanding block. */
 double alignment_if_power(Alignment *a, uint32_t *measured_at);
 /* Optional consumer of full-rate demodulated samples, on the video worker.
@@ -17,6 +18,9 @@ double alignment_if_power(Alignment *a, uint32_t *measured_at);
 void alignment_set_consumer(Alignment *a, void (*consume)(void *, const float *, size_t), void *opaque);
 /* Enable linear-phase video correction after the raw audio consumer. */
 int alignment_set_deemphasis(Alignment *a);
+/* Optional 10 Hz IQ DC rejection before FM, after the IF power measurement.
+ * Waits for the outstanding job; preserved and reinitialized by reset. */
+void alignment_set_dc_block(Alignment *a,int enabled);
 void alignment_set_fm_mode(Alignment *a, int mode, int invert);
 void alignment_reset(Alignment *a, int invert);
 void alignment_destroy(Alignment *a);

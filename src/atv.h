@@ -16,6 +16,7 @@ typedef struct {
     double rate, frequency, bandwidth, if_bandwidth, gain, deviation, seconds, line_hz;
     size_t channel, rx_block;
     int invert, free_sync, loop, video_deemphasis, experimental_sync, fm_mode;
+    int iq_dc_block; /* 0 automatic (HackRF), 1 on, 2 off. */
     const char *pluto_uri;
     const char *audio_output; /* SDL playback device name; empty = system default. */
     int status_enabled, status_port;
@@ -23,6 +24,7 @@ typedef struct {
     const char *record;
     double record_seconds;
     double alignment_bandwidth;
+    int hackrf_amp; /* RF preamplifier enabled (nominally 14 dB). */
     double hackrf_vga; /* Fixed RX VGA in dB; UI gain controls LNA only. */
 } Config;
 typedef struct Source Source;

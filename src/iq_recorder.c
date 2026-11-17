@@ -1,4 +1,5 @@
 #include "iq_recorder.h"
+#include "iq_dc_block.h"
 #include "version.h"
 #include <SDL.h>
 #include <errno.h>
@@ -54,22 +55,24 @@ static int save_metadata(FILE *f,const IQRecordSettings *s,const IQRecordStatus 
         "  \"rf_bandwidth_hz\": %.12g, \"gain_db\": %.12g, \"hackrf_vga_db\": %.12g,\n"
         "  \"if_bandwidth_hz\": %.12g, \"alignment_bandwidth_hz\": %.12g,\n"
         "  \"fm_mode\": %d, \"deviation_hz\": %.12g, \"pal_deemphasis\": %s,\n"
+        "  \"iq_dc_block\": %s,\n"
         "  \"invert\": %s, \"free_sync\": %s, \"experimental_sync\": %s,\n"
         "  \"line_hz\": %.12g, \"vertical_shift_lines\": %d, \"audio_source\": %d,\n"
         "  \"playback_command\": \"%s --no-config --no-wizard --file %s"
         " --rate %.12g --frequency %.12g --lo %.12g --bandwidth %.12g"
         " --if-bandwidth %.12g --alignment-bandwidth %.12g --deviation %.12g"
-        " --fm-mode %d --video-deemphasis %s --line-hz %.12g%s%s%s\"\n}\n",
+        " --fm-mode %d --video-deemphasis %s --line-hz %.12g%s%s%s%s\"\n}\n",
         ATV_VERSION,status->count,status->count/c->rate,status->reason,
         c->mode,c->frequency+c->lo,c->frequency,c->lo,c->rate,
         c->bandwidth,c->gain,c->hackrf_vga,c->if_bandwidth,c->alignment_bandwidth,
         c->fm_mode,c->deviation,c->video_deemphasis?"true":"false",
+        iq_dc_block_enabled(c)?"true":"false",
         c->invert?"true":"false",c->free_sync?"true":"false",c->experimental_sync?"true":"false",
         c->line_hz,s->vertical_shift,s->audio_source,program,status->path,
         c->rate,c->frequency+c->lo,c->lo,c->bandwidth,c->if_bandwidth,c->alignment_bandwidth,
         c->deviation,c->fm_mode,c->video_deemphasis?"pal":"off",c->line_hz,
         c->invert?" --invert":"",c->free_sync?" --free-sync":"",
-        c->experimental_sync?" --experimental-sync":"")>=0;
+        c->experimental_sync?" --experimental-sync":"",iq_dc_block_enabled(c)?" --iq-dc-block on":"")>=0;
 }
 static int writer(void *opaque)
 {

@@ -91,10 +91,10 @@ static int tune_now(Source *s, double *hz, double *gain)
             *gain=59-SoapySDRDevice_getGainElement(s->soapy, SOAPY_SDR_RX, 0, "IFGR");
         } else if(!strcmp(s->c->mode,"hackrf")) {
             /* Bypass Soapy's total-gain distribution. Keep VGA and RF amp
-             * fixed; only the LNA follows the receiver gain control. */
+             * independent; only the LNA follows the receiver gain control. */
             *gain=8*round(fmin(40,fmax(0,*gain))/8);
             S(SoapySDRDevice_setGainElement(s->soapy,SOAPY_SDR_RX,s->c->channel,"VGA",s->c->hackrf_vga));
-            S(SoapySDRDevice_setGainElement(s->soapy,SOAPY_SDR_RX,s->c->channel,"AMP",14));
+            S(SoapySDRDevice_setGainElement(s->soapy,SOAPY_SDR_RX,s->c->channel,"AMP",s->c->hackrf_amp?14:0));
             S(SoapySDRDevice_setGainElement(s->soapy,SOAPY_SDR_RX,s->c->channel,"LNA",*gain));
             *gain=SoapySDRDevice_getGainElement(s->soapy,SOAPY_SDR_RX,s->c->channel,"LNA");
             S(SoapySDRDevice_lastStatus());
@@ -217,7 +217,7 @@ Source *source_open(Config *c)
     fprintf(stderr, "Actual RX: %.6f MHz, %.3f MS/s, BW %.3f MHz, gain %.1f dB\n",
         c->frequency/1e6, c->rate/1e6, c->bandwidth/1e6, c->gain);
     if(!strcmp(c->mode,"hackrf"))
-        fprintf(stderr,"HackRF: RX LNA %.0f dB (UI), RX VGA %.0f dB (fixed), RF AMP 14 dB (on)\n",c->gain,c->hackrf_vga);
+        fprintf(stderr,"HackRF: RX LNA %.0f dB (UI), RX VGA %.0f dB (fixed), RF AMP %s\n",c->gain,c->hackrf_vga,c->hackrf_amp?"on (14 dB)":"off");
     return s;
 fail: source_close(s); return NULL;
 }

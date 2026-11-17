@@ -11,17 +11,20 @@ typedef struct { const char *key; size_t offset; char type; double min,max; int 
 #define C(n,t,lo,hi) {#n,offsetof(Settings,c)+offsetof(Config,n),t,lo,hi,0}
 #define I(n,lo,hi) {#n,offsetof(Settings,n),'i',lo,hi,0}
 #define S(n,k) {#n,offsetof(Settings,c)+offsetof(Config,n),'s',0,0,k}
+#define T(n) {#n,offsetof(Settings,n),'t',0,sizeof(((Settings *)0)->n),0}
 static const Field fields[]={
     S(mode,0), S(args,1), S(images,2), S(antenna,3), S(ref,4), S(file,5), S(pluto_uri,6), S(audio_output,7),
     S(status_bind,8), C(status_enabled,'i',0,1), C(status_port,'i',1,65535),
     C(rate,'d',5e6,64e6), C(frequency,'d',1,1e12), C(lo,'d',-1e12,1e12),
     C(bandwidth,'d',1,64e6), C(if_bandwidth,'d',250000,64e6),
-    C(alignment_bandwidth,'d',0,64e6), C(gain,'d',0,100), C(hackrf_vga,'d',0,62),
+    C(alignment_bandwidth,'d',0,64e6), C(gain,'d',0,100), C(hackrf_vga,'d',0,62), C(hackrf_amp,'i',0,1),
     C(line_hz,'d',15000,16250), C(rx_block,'z',2048,1048576), C(channel,'z',0,1),
     C(invert,'i',0,1), C(free_sync,'i',0,1), C(loop,'i',0,1),
     C(fm_mode,'i',0,1), C(video_deemphasis,'i',0,1), C(experimental_sync,'i',0,1),
+    C(iq_dc_block,'i',0,2),
     I(stacking,0,1), I(stack_frames,1,512), I(rolling,0,1), I(paused,0,1), I(light_stacking,0,1),
-    I(vertical_shift,-312,312), I(audio_source,0,3), I(audio_muted,0,1), I(audio_swap,0,1)
+    I(vertical_shift,-312,312), I(audio_source,0,3), I(audio_muted,0,1), I(audio_swap,0,1),
+    T(my_call), T(my_locator)
 };
 static const Field *field(const char *key)
 {
@@ -33,6 +36,7 @@ static void value(const Settings *s,const Field *f,char *buf,size_t n)
 {
     const void *p=(const char *)s+f->offset;
     if(f->type=='s') { const char *v=*(const char *const *)p; snprintf(buf,n,"%s",v?v:""); }
+    else if(f->type=='t') snprintf(buf,n,"%s",(const char *)p);
     else if(f->type=='d') snprintf(buf,n,"%.17g",*(const double *)p);
     else if(f->type=='z') snprintf(buf,n,"%zu",*(const size_t *)p);
     else snprintf(buf,n,"%d",*(const int *)p);
@@ -40,6 +44,10 @@ static void value(const Settings *s,const Field *f,char *buf,size_t n)
 static int assign(Settings *s,const Field *f,const char *v)
 {
     void *p=(char *)s+f->offset;
+    if(f->type=='t') {
+        if(strlen(v)>=(size_t)f->max || strchr(v,'\n') || strchr(v,'\r')) return 0;
+        strcpy(p,v); return 1;
+    }
     if(f->type=='s') {
         if(strlen(v)>=sizeof(s->strings[0]) || strchr(v,'\n') || strchr(v,'\r')) return 0;
         if(!strcmp(f->key,"mode") && strcmp(v,"demo") && strcmp(v,"file") && strcmp(v,"b210") && strcmp(v,"hackrf") && strcmp(v,"pluto") && strcmp(v,"sdrplay")) return 0;
@@ -90,7 +98,7 @@ int settings_load(Settings *s,const char *path,int required)
     if(!ok) fprintf(stderr,"%s:%u: invalid configuration entry\n",path,n);
     return ok;
 }
-int settings_save(const Settings *s,const char *path)
+static int save_file(const Settings *s,const char *path,int profile)
 {
     char tmp[4096];
     if(snprintf(tmp,sizeof(tmp),"%s.XXXXXX",path)>=(int)sizeof(tmp)) { errno=ENAMETOOLONG; return 0; }
@@ -100,7 +108,9 @@ int settings_save(const Settings *s,const char *path)
     int ok=fputs("# FM ATV startup configuration\n",fp)>=0;
     for(size_t i=0;i<sizeof(fields)/sizeof(*fields) && ok;++i) {
         char buf[1024]; const Field *f=&fields[i];
-        const char *str=f->type=='s'?*(const char *const *)((const char *)s+f->offset):NULL;
+        if(profile && !strcmp(f->key,"experimental_sync")) continue;
+        const void *p=(const char *)s+f->offset;
+        const char *str=f->type=='s'?*(const char *const *)p:f->type=='t'?p:NULL;
         if(str && (strlen(str)>=sizeof(buf) || strchr(str,'\n') || strchr(str,'\r'))) { errno=EINVAL; ok=0; break; }
         value(s,f,buf,sizeof(buf));
         if(fprintf(fp,"%s=%s\n",f->key,buf)<0) ok=0;
@@ -112,17 +122,43 @@ int settings_save(const Settings *s,const char *path)
     if(!ok) { unlink(tmp); errno=err?err:EIO; }
     return ok;
 }
+static int profile_path(char *buf,size_t n,const char *base,const char *mode)
+{
+    if(strcmp(mode,"b210") && strcmp(mode,"hackrf") && strcmp(mode,"pluto") && strcmp(mode,"sdrplay")) return 0;
+    int len=snprintf(buf,n,"%s.%s",base,mode);
+    if(len<0 || (size_t)len>=n) { errno=ENAMETOOLONG; return -1; }
+    return 1;
+}
+int settings_save(const Settings *s,const char *path)
+{
+    char profile[4096]; int rc=profile_path(profile,sizeof(profile),path,s->c.mode);
+    if(rc<0 || (rc && !save_file(s,profile,1))) return 0;
+    return save_file(s,path,0);
+}
 static int ask(Settings *s,SettingsPromptFn prompt,void *opaque,const char *key,const char *label,double min,double max)
 {
     Field f=*field(key); if(f.type!='s') { f.min=min; f.max=max; }
     char current[1024],line[2048],details[256],error[256]="";
     value(s,&f,current,sizeof(current));
-    if(f.type=='s') snprintf(details,sizeof(details),"Enter keeps the current value. '-' clears the field.");
+    if(!strcmp(key,"pluto_uri")) snprintf(details,sizeof(details),
+        "Network example: ip:192.168.2.1\n"
+        "Replace 192.168.2.1 with your Pluto's IP address.\n"
+        "Use the ip: prefix, without http://.\n"
+        "Leave empty and press Enter for automatic USB detection.\n"
+        "To keep a network address, enter it again. '-' also clears the field.");
+    else if(!strcmp(key,"rate") && !strcmp(s->c.mode,"pluto")) snprintf(details,sizeof(details),
+        "Enter a number between %.12g and %.12g.\n"
+        "Measured guidance for this setup:\n"
+        "USB (PlutoSky / ADALM-PLUTO): use <=6 MS/s.\n"
+        "PlutoSky, 1 Gbit/s Ethernet: use 14 MS/s.\n"
+        "Enter keeps the current value.",min,max);
+    else if(f.type=='s') snprintf(details,sizeof(details),"Enter keeps the current value. '-' clears the field.");
     else snprintf(details,sizeof(details),"Enter %s between %.12g and %.12g.\nEnter keeps the current value.",f.type=='d'?"a number":"a whole number",min,max);
     for(;;) {
         SettingsPrompt q={label,current,details,error,0};
         if(!prompt(opaque,&q,line,sizeof(line))) return 0;
-        if(assign(s,&f,*line?(!strcmp(line,"-") && f.type=='s'?"":line):current)) return 1;
+        if(assign(s,&f,*line?(!strcmp(line,"-") && f.type=='s'?"":line):
+                  !strcmp(key,"pluto_uri")?"":current)) return 1;
         snprintf(error,sizeof(error),"Invalid value. %s",!strcmp(key,"alignment_bandwidth")?"Use 0 or at least 250000 Hz.":"Try again.");
     }
 }
@@ -193,7 +229,7 @@ const char *settings_hardware_rate_hint(unsigned index)
     static const char *hints[]={
         "up to 61.44 MS/s (USB 3)",
         "up to 20 MS/s",
-        "approx. 6-8 MS/s (USB, observed)",
+        "USB <=6 MS/s; PlutoSky GbE 14",
         "8 to <10 MS/s (app; untested)"
     };
     return index<4?hints[index]:"";
@@ -202,6 +238,14 @@ int settings_run_wizard_audio(Settings *s,SettingsPromptFn prompt,void *opaque,
                               const char *const *devices,int count)
 {
     char line[64]; const char *error="";
+    if(s->reopen_menu) {
+        s->reopen_menu=0;
+        const char *modes[]={"b210","hackrf","pluto","sdrplay"};
+        for(int i=0;i<4;++i) if(!strcmp(s->c.mode,modes[i])) {
+            snprintf(line,sizeof(line),"%d",i+1); goto hardware_selected;
+        }
+        goto choose_hardware;
+    }
     for(;;) {
         SettingsPrompt q={"Startup wizard","","Enter = skip and start.\nW + Enter = choose hardware and settings.",error,1};
         if(!prompt(opaque,&q,line,sizeof(line))) return 0;
@@ -209,6 +253,7 @@ int settings_run_wizard_audio(Settings *s,SettingsPromptFn prompt,void *opaque,
         if(!strcmp(line,"w") || !strcmp(line,"W")) break;
         error="Press Enter (skip) or W + Enter.";
     }
+choose_hardware:
     error="";
     for(;;) {
         char hardware_details[640];
@@ -223,51 +268,99 @@ int settings_run_wizard_audio(Settings *s,SettingsPromptFn prompt,void *opaque,
         if(strlen(line)==1 && *line>='1' && *line<='4') break;
         error="Choose 1, 2, 3 or 4 and press Enter.";
     }
+hardware_selected:;
     const char *mode=*line=='1'?"b210":*line=='2'?"hackrf":*line=='3'?"pluto":"sdrplay";
     int changed=strcmp(s->c.mode,mode)!=0;
     assign(s,field("mode"),mode);
-    if(changed) { s->c.rx_block=settings_default_rx_block(mode); assign(s,field("args"),""); s->c.channel=0; assign(s,field("ref"),"internal"); }
-    if(changed && !strcmp(mode,"sdrplay")) {
+    int restored=0;
+    if(changed && s->load_profiles && *s->profile_base) {
+        char path[4096]; int rc=profile_path(path,sizeof(path),s->profile_base,mode);
+        if(rc<0) return 0;
+        if(rc && access(path,F_OK)==0) {
+            int experimental_sync=s->c.experimental_sync;
+            if(!settings_load(s,path,1) || strcmp(s->c.mode,mode)) return 0;
+            s->c.experimental_sync=experimental_sync; /* Global, including with legacy SDR profiles. */
+            restored=1;
+        }
+    }
+    if(changed && !restored) { s->c.rx_block=settings_default_rx_block(mode); assign(s,field("args"),""); s->c.channel=0; assign(s,field("ref"),"internal"); }
+    if(changed && !restored && !strcmp(mode,"sdrplay")) {
         s->c.rate=8e6; s->c.bandwidth=8e6; s->c.if_bandwidth=8e6;
     }
-#define ASK(k,label,lo,hi) do { if(!ask(s,prompt,opaque,k,label,lo,hi)) return 0; } while(0)
-    double previous_rate=s->c.rate;
-    ASK("rate","Sample rate (samples/s)",settings_min_rate(mode),!strcmp(mode,"sdrplay")?9999999:!strcmp(mode,"hackrf")?20e6:!strcmp(mode,"b210")?61.44e6:64e6);
-    /* Below 8 MS/s keep 500 kHz per side; otherwise keep 1 MHz.
-     * SDRplay remains >= 8 MS/s, with analog BW below 8 MHz. */
+    if(!strcmp(mode,"hackrf")) s->c.gain=8*round(fmin(40,fmax(0,s->c.gain))/8);
+    if(!strcmp(mode,"sdrplay")) s->c.gain=fmin(39,fmax(0,s->c.gain));
+    /* One overview, with only the chosen setting opened for editing. */
+    if(s->c.rate<settings_min_rate(mode) ||
+       s->c.rate>(!strcmp(mode,"sdrplay")?9999999:!strcmp(mode,"hackrf")?20e6:!strcmp(mode,"b210")?61.44e6:64e6))
+        s->c.rate=8e6;
     s->c.bandwidth=s->c.rate-(s->c.rate<8e6?1e6:2e6);
-    if(!ask_rx_block(s,prompt,opaque)) return 0;
-    /* A different receiver/rate needs a fresh, usable suggestion. Preserve
-     * deliberate narrower filters when revisiting the same configuration. */
-    if(changed || s->c.rate!=previous_rate || s->c.if_bandwidth>s->c.rate)
-        s->c.if_bandwidth=s->c.bandwidth;
-    ASK("if_bandwidth","Video IF bandwidth (Hz)",250000,s->c.rate);
+    if((changed && !restored) || s->c.if_bandwidth>s->c.rate) s->c.if_bandwidth=s->c.bandwidth;
     s->c.alignment_bandwidth=3200000;
-    ASK("lo","Converter LO (Hz, 0 = no converter)",-1e12,1e12);
-    double min_rf=!strcmp(mode,"sdrplay")?1000:1, max_rf=!strcmp(mode,"sdrplay")?2e9:6e9;
-    if(s->c.frequency-s->c.lo<min_rf || s->c.frequency-s->c.lo>max_rf)
-        ASK("frequency","Receive frequency including converter (Hz)",fmax(1,s->c.lo+min_rf),s->c.lo+max_rf);
-    ASK("video_deemphasis","PAL de-emphasis (0 = off, 1 = on)",0,1);
-    ASK("experimental_sync","Experimental sync (0 = off, 1 = on)",0,1);
-    if(!strcmp(mode,"b210")) {
-        ASK("args","UHD device selection (e.g. serial=...)",0,0);
-        ASK("images","UHD images directory",0,0);
-        ASK("channel","Receive channel",0,1);
-        ASK("antenna","Antenna (TX/RX or RX2)",0,0);
-        ASK("ref","Clock reference (internal, external, gpsdo)",0,0);
-    } else if(!strcmp(mode,"sdrplay")) {
-        ASK("args","Soapy device selection (empty = driver=sdrplay)",0,0);
-        s->c.channel=0;
-    } else if(!strcmp(mode,"hackrf")) {
-        ASK("args","Soapy device selection (empty = driver=hackrf)",0,0);
-        s->c.channel=0;
-    } else {
-        ASK("pluto_uri","Pluto URI (empty = automatic USB)",0,0);
-        s->c.channel=0; assign(s,field("ref"),"internal");
+    for(;;) {
+        typedef struct { const char *key,*label; double min,max; } MenuItem;
+        MenuItem items[20];
+        int total=0;
+#define ADD(k,label,lo,hi) do { items[total++]=(MenuItem){k,label,lo,hi}; } while(0)
+        ADD("rate","Sample rate (samples/s)",settings_min_rate(mode),!strcmp(mode,"sdrplay")?9999999:!strcmp(mode,"hackrf")?20e6:!strcmp(mode,"b210")?61.44e6:64e6);
+        ADD("rx_block","Receive block size",0,0);
+        ADD("if_bandwidth","Video IF bandwidth (Hz)",250000,s->c.rate);
+        ADD("lo","Converter LO (Hz, 0 = no converter)",-1e12,1e12);
+        double min_rf=!strcmp(mode,"sdrplay")?1000:1, max_rf=!strcmp(mode,"sdrplay")?2e9:6e9;
+        ADD("frequency","Receive frequency including converter (Hz)",fmax(1,s->c.lo+min_rf),s->c.lo+max_rf);
+        if(!strcmp(mode,"hackrf")) {
+            ADD("hackrf_amp","HackRF preamp (0 = off, 1 = on)",0,1);
+            ADD("hackrf_vga","HackRF VGA (dB, step 2; default 12)",0,62);
+            ADD("gain","RX LNA gain (dB, step 8; Up/Down during RX)",0,40);
+        } else ADD("gain","Receive gain (dB; Up/Down during RX)",0,!strcmp(mode,"sdrplay")?39:100);
+        if(!strcmp(mode,"b210")) {
+            ADD("args","UHD device selection (e.g. serial=...)",0,0);
+            ADD("images","UHD images directory",0,0);
+            ADD("channel","Receive channel",0,1);
+            ADD("antenna","Antenna (TX/RX or RX2)",0,0);
+            ADD("ref","Clock reference (internal, external, gpsdo)",0,0);
+        } else if(!strcmp(mode,"pluto")) ADD("pluto_uri","Pluto URI (empty = USB)",0,0);
+        else ADD("args","Soapy device selection (empty = automatic)",0,0);
+        if(count>=0) ADD("audio_output","Audio output (speakers / sound card)",0,0);
+#undef ADD
+        char details[4096],title[128]; size_t used=0;
+        snprintf(title,sizeof(title),"%s settings - choose a number or click",mode);
+        for(int i=0;i<total;++i) {
+            char current[1024]; value(s,field(items[i].key),current,sizeof(current));
+            used+=(size_t)snprintf(details+used,sizeof(details)-used,"%d. %s: %.32s\n",i+1,items[i].label,*current?current:"-");
+        }
+        snprintf(details+used,sizeof(details)-used,"Enter = start; W = save; H = choose SDR. Analog BW: %.3f MHz (automatic).",s->c.bandwidth/1e6);
+        SettingsPrompt q={title,"",details,error,SETTINGS_MENU};
+        if(!prompt(opaque,&q,line,sizeof(line))) return 0;
+        if(!*line) {
+            if(s->c.frequency-s->c.lo<min_rf || s->c.frequency-s->c.lo>max_rf) {
+                error="Receive frequency minus converter LO is outside this SDR's range."; continue;
+            }
+            return 1;
+        }
+        if(!strcmp(line,"h") || !strcmp(line,"H")) goto choose_hardware;
+        if(!strcmp(line,"w") || !strcmp(line,"W") || !strcmp(line,"s") || !strcmp(line,"S")) {
+            if(!*s->profile_base) error="No configuration path available.";
+            else if(settings_save(s,s->profile_base)) error="SDR profile and startup settings saved.";
+            else error="Saving failed. Check configuration directory permissions.";
+            continue;
+        }
+        char *end; long choice=strtol(line,&end,10);
+        if(end==line || *end || choice<1 || choice>total) { error="Choose a setting number, or Enter to start."; continue; }
+        error=""; int i=(int)choice-1;
+        const char *key=items[i].key;
+        if(!strcmp(key,"rx_block")) { if(!ask_rx_block(s,prompt,opaque)) return 0; }
+        else if(!strcmp(key,"audio_output")) { if(!ask_audio_output(s,prompt,opaque,devices,count)) return 0; }
+        else if(!strcmp(key,"hackrf_amp")) s->c.hackrf_amp=!s->c.hackrf_amp;
+        else {
+            double previous_rate=s->c.rate;
+            if(!ask(s,prompt,opaque,key,items[i].label,items[i].min,items[i].max)) return 0;
+            if(!strcmp(key,"rate") && s->c.rate!=previous_rate) {
+                s->c.bandwidth=s->c.rate-(s->c.rate<8e6?1e6:2e6);
+                s->c.if_bandwidth=s->c.bandwidth;
+            }
+            if(!strcmp(mode,"hackrf") && !strcmp(key,"gain")) s->c.gain=8*round(s->c.gain/8);
+        }
     }
-    if(count>=0 && !ask_audio_output(s,prompt,opaque,devices,count)) return 0;
-    return 1;
-#undef ASK
 }
 int settings_run_wizard(Settings *s,SettingsPromptFn prompt,void *opaque)
 {

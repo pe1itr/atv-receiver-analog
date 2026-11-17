@@ -23,6 +23,10 @@ BEDIENING
 A = dempen, O = tv/oscilloscoop, P = screenshot, Q of Esc = afsluiten.
 S = stacking aan/uit; boven 10 MS/s: rolling 6 beelden in kleur, volledig tv-vlak.
 F9 = IQ-opname starten/stoppen; standaard 3 seconden, automatisch opslaan.
+F10 = screenshot en 30 seconden diagnose opnemen; nogmaals drukken stopt eerder.
+Shift+F10 = pad van het opgeslagen diagnosebestand kopieren.
+F7 = roepnaam en locator instellen; W bewaart ze.
+E = video-de-emphasis aan/uit; I = videopolariteit omkeren.
 De .cf32-opname en .cf32.json-instellingen staan in de huidige werkmap.
 Kies de geluidsuitgang in de wizard; 0 = Windows-standaarduitgang.
 Bij 10 MS/s is geen audio beschikbaar. FM 6 MHz en NICAM vereisen

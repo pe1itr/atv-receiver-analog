@@ -22,6 +22,7 @@
 /recordings/
 /screenshots/
 /measurements/
+/atv-diagnose-*.txt
 /uhd-images/
 
 # Gebouwde software, downloads en Python-cache.

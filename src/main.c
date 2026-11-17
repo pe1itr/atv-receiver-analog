@@ -13,6 +13,9 @@
 #include "iq_recorder.h"
 #include "light_stack.h"
 #include "clipping.h"
+#include "iq_dc_block.h"
+#include "iq_power.h"
+#include "diagnostic_log.h"
 #include <unistd.h>
 #include <SDL.h>
 #include <fftw3.h>
@@ -38,7 +41,8 @@ static int color_enabled(double rate, double bandwidth)
     return rate>=12e6 && bandwidth>=10e6;
 }
 
-enum { UI_SIDE_WIDTH=140, UI_WIDTH=960+2*UI_SIDE_WIDTH, UI_HEIGHT=880 };
+enum { UI_SIDE_WIDTH=140, UI_CONTROL_WIDTH=400,
+       UI_WIDTH=UI_SIDE_WIDTH+960+UI_CONTROL_WIDTH, UI_HEIGHT=880 };
 
 typedef struct {
     float power[FFT_SIZE];
@@ -90,7 +94,8 @@ static int spectrum_y(const SpectrumScale *scale,float db)
 typedef struct {
     uint32_t pixels[WIDTH*HEIGHT];
     uint32_t guide[WIDTH*HEIGHT];
-    int guided, synced, lightweight;
+    int guided, synced;
+    int lightweight; /* 0 aligned stack, 1 six-picture RGB, 2 variable live RGB. */
     int valid, phase, clear_pending;
     const char *reason;
     double period_x, period_y;
@@ -100,6 +105,7 @@ typedef struct {
 typedef struct {
     Config c;
     Decoder *decoder; /* Worker-owned, used in its callback. */
+    char my_call[17], my_locator[11]; /* UI-owned station identification. */
     FrameStack stack; /* UI statistics/settings only; worker owns the accumulator. */
     StackFrame queued;
     SDL_cond *stack_ready;
@@ -107,6 +113,16 @@ typedef struct {
     unsigned stack_epoch, stack_reset_id, stack_motion_id;
     uint64_t stack_skipped;
     int stacking, stack_paused, stack_hsync, sync_locked;
+    int horizontal_locked, vertical_locked;
+    /* Observed at decoder frame callbacks, retained between F10 snapshots. */
+    uint64_t horizontal_losses, vertical_losses, sync_losses, frame_stalls;
+    uint32_t max_frame_gap_ms;
+    int sync_observed, have_hsync, have_vsync;
+    uint64_t horizontal_age_fields;
+    double vertical_age_ms;
+    uint64_t consumed_samples;
+    uint64_t diagnosis_previous_samples;
+    uint32_t diagnosis_previous_tick;
     int light_stacking;
     unsigned light_count;
     uint64_t light_input_serial;
@@ -122,7 +138,7 @@ typedef struct {
     SDL_atomic_t playback_refills, playback_resets, playback_max_gap_us;
     SDL_AudioDeviceID audio_device;
     double requested_hz, requested_gain, actual_hz, actual_gain;
-    int command, invert, free_sync, vertical_shift, fm_mode;
+    int command, invert, free_sync, vertical_shift, fm_mode, video_deemphasis, experimental_sync;
     int afc_enabled, afc_state; /* 0 seeking, 1 tracking, 2 outside capture range. */
     unsigned afc_epoch;
     double afc_anchor;
@@ -146,16 +162,44 @@ typedef struct {
 
 /* Only scalar diagnostics are copied; no image or IQ data enters the API. */
 static double json_number(double x) { return isfinite(x)?x:0; }
+static const char *sync_indicator_reason(const App *a,uint32_t now)
+{
+    if(!a->last_frame) return "no_video";
+    if(now-a->last_frame>=150) return "stale_video";
+    if(!a->horizontal_locked && !a->vertical_locked) return "no_hv_sync";
+    if(!a->horizontal_locked) return "no_h_sync";
+    if(!a->vertical_locked) return "no_v_sync";
+    return "locked";
+}
+static void sync_diagnostics_frame(App *a,uint32_t now,int horizontal,int vertical)
+{
+    if(a->sync_observed) {
+        if(a->horizontal_locked && !horizontal) ++a->horizontal_losses;
+        if(a->vertical_locked && !vertical) ++a->vertical_losses;
+        if(a->sync_locked && !(horizontal && vertical)) ++a->sync_losses;
+        uint32_t gap=now-a->last_frame;
+        if(gap>=150) ++a->frame_stalls;
+        if(gap>a->max_frame_gap_ms) a->max_frame_gap_ms=gap;
+    }
+    a->sync_observed=1;
+    a->horizontal_locked=horizontal;
+    a->vertical_locked=vertical;
+    a->sync_locked=horizontal && vertical;
+}
 static int status_json(void *opaque,char *out,size_t capacity)
 {
     App *a=opaque;
 #define B(x) ((x)?"true":"false")
 #define N(x) json_number(x)
     SDL_LockMutex(a->mutex);
+    uint32_t now=SDL_GetTicks();
+    char h_age[48]="null",v_age[48]="null";
+    if(a->have_hsync) snprintf(h_age,sizeof(h_age),"%llu",(unsigned long long)a->horizontal_age_fields);
+    if(a->have_vsync) snprintf(v_age,sizeof(v_age),"%.9g",a->vertical_age_ms);
     int light_mode=a->c.rate>10e6 && !a->stacking;
     char hackrf_gains[160]="";
     if(!strcmp(a->c.mode,"hackrf"))
-        snprintf(hackrf_gains,sizeof(hackrf_gains),",\"gain_control\":\"lna\",\"rx_lna_db\":%.12g,\"rx_vga_db\":%.12g,\"rf_amp_db\":14",a->actual_gain,a->c.hackrf_vga);
+        snprintf(hackrf_gains,sizeof(hackrf_gains),",\"gain_control\":\"lna\",\"rx_lna_db\":%.12g,\"rx_vga_db\":%.12g,\"rf_amp_db\":%d",a->actual_gain,a->c.hackrf_vga,a->c.hackrf_amp?14:0);
     char if_level[48];
     if(isfinite(a->if_power_dbfs)) snprintf(if_level,sizeof(if_level),"%.12g",a->if_power_dbfs);
     else strcpy(if_level,"null");
@@ -171,17 +215,19 @@ static int status_json(void *opaque,char *out,size_t capacity)
     const char *quality_reason=a->info_paused?"paused":
         a->quality_tick && !quality_fresh?"stale":video_quality_status(&a->quality);
     int n=snprintf(out,capacity,
-        "{\"schema_version\":1,\"version\":\"%s\",\"build_utc\":\"%s\","
+        "{\"schema_version\":1,\"version\":\"%s\",\"build_utc\":\"%s\",\"git_commit\":\"%s\","
         "\"timestamp_unix_s\":%lld,\"metrics_available\":%s,\"metrics_age_ms\":%u,"
         "\"source\":\"%s\",\"done\":%s,\"failed\":%s,\"reception_paused\":%s,"
         "\"receiver\":{\"frequency_hz\":%.12g,\"sdr_frequency_hz\":%.12g,\"requested_frequency_hz\":%.12g,"
         "\"converter_lo_hz\":%.12g,\"sample_rate_sps\":%.12g,\"rf_bandwidth_hz\":%.12g,"
         "\"if_bandwidth_hz\":%.12g,\"alignment_bandwidth_hz\":%.12g,\"gain_db\":%.12g,"
         "\"fm_mode\":%d,\"deviation_hz\":%.12g,\"invert\":%s,\"pal_deemphasis\":%s,"
-        "\"rx_block_samples\":%zu,\"channel\":%zu,\"experimental_sync\":%s,\"requested_gain_db\":%.12g%s},"
+        "\"rx_block_samples\":%zu,\"channel\":%zu,\"experimental_sync\":%s,\"iq_dc_block\":%s,\"requested_gain_db\":%.12g%s},"
         "\"video\":{\"signal_dbfs\":%.12g,\"if_signal_dbfs\":%s,\"if_signal_age_ms\":%u,\"fields\":%u,\"discontinuities\":%u,"
-        "\"sync_locked\":%s,\"color_enabled\":%s,\"color_locked\":%s,\"free_sync\":%s,\"line_hz\":%.12g,\"vertical_shift_lines\":%d},"
-        "\"clipping\":{\"active\":%s,\"clipped_samples\":%llu,\"inspected_samples\":%llu,\"last_clip_age_ms\":%u},"
+        "\"sync_locked\":%s,\"color_enabled\":%s,\"color_locked\":%s,\"free_sync\":%s,\"line_hz\":%.12g,\"vertical_shift_lines\":%d,\"horizontal_locked\":%s,\"vertical_locked\":%s,\"raster_hz\":%.12g,\"age_ms\":%u,\"consumed_samples\":%llu},"
+        "\"sync_diagnostics\":{\"indicator_reason\":\"%s\",\"horizontal_losses\":%llu,\"vertical_losses\":%llu,\"combined_losses\":%llu,"
+        "\"horizontal_age_fields\":%s,\"vertical_age_ms\":%s,\"completed_frame_stalls\":%llu,\"max_completed_frame_gap_ms\":%u},"
+        "\"clipping\":{\"active\":%s,\"repeated\":%s,\"clipped_samples\":%llu,\"inspected_samples\":%llu,\"last_clip_age_ms\":%u},"
         "\"video_quality\":{\"valid\":%s,\"age_ms\":%u,\"video_snr_db\":%s,\"noise_rms\":%s,"
         "\"sync_depth\":%s,\"sync_depth_error\":%s,\"reason\":\"%s\","
         "\"lines\":%u,\"method\":\"pal_back_porch_sync_scaled_unweighted\"},"
@@ -195,16 +241,21 @@ static int status_json(void *opaque,char *out,size_t capacity)
         "\"playback_refills\":%u,\"playback_resets\":%u,\"playback_max_supply_gap_ms\":%.3f},"
         "\"rx_queue\":{\"queued_samples\":%zu,\"peak_samples\":%zu,\"capacity_samples\":%zu,"
         "\"discarded_samples\":%llu,\"hardware_overflows\":%llu}}\n",
-        ATV_VERSION,ATV_BUILD_UTC,(long long)time(NULL),B(a->metrics_tick!=0),
+        ATV_VERSION,ATV_BUILD_UTC,ATV_GIT_COMMIT,(long long)time(NULL),B(a->metrics_tick!=0),
         a->metrics_tick?SDL_GetTicks()-a->metrics_tick:0,a->c.mode,
         B(SDL_AtomicGet(&a->done)),B(SDL_AtomicGet(&a->failed)),B(a->info_paused),
         N(a->actual_hz+a->c.lo),N(a->actual_hz),N(a->requested_hz+a->c.lo),N(a->c.lo),N(a->c.rate),N(a->c.bandwidth),
         N(a->if_bandwidth),N(a->c.alignment_bandwidth>0?a->c.alignment_bandwidth:a->if_bandwidth),N(a->actual_gain),
-        a->fm_mode,N(a->c.deviation),B(a->invert),B(a->c.video_deemphasis),
-        a->c.rx_block,a->c.channel,B(a->c.experimental_sync),N(a->requested_gain),hackrf_gains,
+        a->fm_mode,N(a->c.deviation),B(a->invert),B(a->video_deemphasis),
+        a->c.rx_block,a->c.channel,B(a->experimental_sync),B(iq_dc_block_enabled(&a->c)),N(a->requested_gain),hackrf_gains,
         N(a->power),if_level,isfinite(a->if_power_dbfs)?SDL_GetTicks()-a->if_power_tick:0,a->frames,a->overflows,B(a->sync_locked),B(color_enabled(a->c.rate,a->if_bandwidth)),
         B(a->color_locked),B(a->free_sync),N(a->line_hz),a->vertical_shift,
+        B(a->horizontal_locked),B(a->vertical_locked),N(a->raster_hz),
+        a->last_frame?SDL_GetTicks()-a->last_frame:0,(unsigned long long)a->consumed_samples,
+        sync_indicator_reason(a,now),(unsigned long long)a->horizontal_losses,(unsigned long long)a->vertical_losses,
+        (unsigned long long)a->sync_losses,h_age,v_age,(unsigned long long)a->frame_stalls,a->max_frame_gap_ms,
         B(clipping_active(&a->clipping,SDL_GetTicks())),
+        B(clipping_repeated(&a->clipping,SDL_GetTicks())),
         (unsigned long long)a->clipping.clipped_samples,(unsigned long long)a->clipping.samples,
         a->clipping.clipped_samples?SDL_GetTicks()-a->clipping.last_clip_tick:0,
         B(quality_valid),a->quality_tick?SDL_GetTicks()-a->quality_tick:0,snr,noise,depth,uncertainty,quality_reason,
@@ -265,11 +316,138 @@ static void afc_toggle(App *a)
     afc_manual_tune(a);
 }
 
+/* This callback runs on the UI thread. Copy scalars under the same mutex as
+ * the status API; formatting and file saving do not block the DSP thread. */
+static int diagnostic_snapshot(void *opaque,char *out,size_t capacity)
+{
+    App *a=opaque;
+    char raw[8192];
+    int raw_size=status_json(a,raw,sizeof(raw));
+    if(raw_size<=0 || (size_t)raw_size>=sizeof(raw)) return -1;
+    SDL_LockMutex(a->mutex);
+    Uint32 now=SDL_GetTicks(),elapsed=now-a->diagnosis_previous_tick;
+    int have_rate=a->diagnosis_previous_tick && elapsed && a->consumed_samples>=a->diagnosis_previous_samples;
+    double throughput=have_rate?(a->consumed_samples-a->diagnosis_previous_samples)*1000.0/elapsed/1e6:0;
+    a->diagnosis_previous_tick=now; a->diagnosis_previous_samples=a->consumed_samples;
+    int fresh=a->last_frame && now-a->last_frame<150;
+    int quality_fresh=a->quality_tick && now-a->quality_tick<1000 && !a->info_paused;
+    char snr[96],throughput_text[96],if_text[64];
+    if(have_rate) snprintf(throughput_text,sizeof(throughput_text),"%.6f MS/s",throughput);
+    else snprintf(throughput_text,sizeof(throughput_text),"unavailable (first snapshot or counter reset)");
+    if(isfinite(a->if_power_dbfs)) snprintf(if_text,sizeof(if_text),"%.3f dBFS",a->if_power_dbfs);
+    else snprintf(if_text,sizeof(if_text),"unavailable");
+    if(quality_fresh && a->quality.valid) snprintf(snr,sizeof(snr),"%.3f dB",a->quality.video_snr_db);
+    else snprintf(snr,sizeof(snr),"unavailable (%s)",a->info_paused?"paused":!quality_fresh?"stale or no snapshot":video_quality_status(&a->quality));
+    int n=snprintf(out,capacity,
+        "UTC Unix time: %lld\n"
+        "Receiver: %s; paused=%d done=%d failed=%d; metrics age=%u ms\n"
+        "Tuning RF: requested=%.6f MHz actual=%.6f MHz; SDR=%.6f MHz; converter LO=%.6f MHz\n"
+        "AFC: %s; anchor SDR=%.6f MHz; applied offset=%.3f kHz (not residual error)\n"
+        "Rate=%.6f MS/s; RF BW=%.6f MHz; video IF=%.6f MHz; sync IF=%.6f MHz; gain=%.2f dB\n"
+        "FM%d/D%d; inversion=%d; PAL de-emphasis=%d; experimental sync=%d; free sync=%d\n"
+        "Sync: H=%d V=%d combined=%d; video fresh=%d age=%u ms; raster=%.6f Hz (0=unavailable)\n"
+        "Sync indicator: %s; cumulative observed losses H=%llu V=%llu combined=%llu; completed frame gaps >=150 ms=%llu max=%u ms\n"
+        "Color: enabled=%d locked=%d; IF level=%s age=%u ms; Video-SNR=%s\n"
+        "Consumed throughput: %s; total samples=%llu; queue=%.3f ms (peak=%.3f ms)\n"
+        "Cumulative: discontinuities=%u discarded=%llu hardware overflows=%llu; clipping samples=%llu\n"
+        "Raw status (full precision; compare counters and settings between snapshots):\n%s\n",
+        (long long)time(NULL),a->c.mode,a->info_paused,SDL_AtomicGet(&a->done),SDL_AtomicGet(&a->failed),
+        a->metrics_tick?now-a->metrics_tick:0,
+        (a->requested_hz+a->c.lo)/1e6,(a->actual_hz+a->c.lo)/1e6,a->actual_hz/1e6,a->c.lo/1e6,
+        !a->afc_enabled?"OFF":a->afc_state==1?"TRACK":a->afc_state==2?"LIMIT":"SEEK (no reliable estimate)",
+        a->afc_anchor/1e6,(a->actual_hz-a->afc_anchor)/1000,
+        a->c.rate/1e6,a->c.bandwidth/1e6,a->if_bandwidth/1e6,
+        (a->c.alignment_bandwidth>0?a->c.alignment_bandwidth:a->if_bandwidth)/1e6,a->actual_gain,
+        a->fm_mode,a->fm_mode,a->invert,a->video_deemphasis,a->experimental_sync,a->free_sync,
+        a->horizontal_locked,a->vertical_locked,a->sync_locked,fresh,a->last_frame?now-a->last_frame:0,a->raster_hz,
+        sync_indicator_reason(a,now),(unsigned long long)a->horizontal_losses,(unsigned long long)a->vertical_losses,
+        (unsigned long long)a->sync_losses,(unsigned long long)a->frame_stalls,a->max_frame_gap_ms,
+        color_enabled(a->c.rate,a->if_bandwidth),a->color_locked,if_text,
+        isfinite(a->if_power_dbfs)?now-a->if_power_tick:0,snr,
+        throughput_text,(unsigned long long)a->consumed_samples,
+        1000.0*a->rx_stats.queued_samples/a->c.rate,1000.0*a->rx_stats.peak_samples/a->c.rate,
+        a->overflows,(unsigned long long)a->rx_stats.discarded_samples,
+        (unsigned long long)a->rx_stats.hardware_overflows,(unsigned long long)a->clipping.clipped_samples,raw);
+    SDL_UnlockMutex(a->mutex);
+    return n;
+}
+
 typedef struct {
     int active;
     char value[32];
     const char *error;
 } FrequencyInput;
+
+typedef struct {
+    int active, field;
+    char my_call[17], my_locator[11];
+    const char *error;
+} StationInput;
+
+static int valid_locator(const char *s)
+{
+    size_t n=strlen(s);
+    if(!n) return 1; /* Identification is optional. */
+    if(n<4 || n>10 || n%2) return 0;
+    for(size_t i=0;i<n;++i) {
+        char low=(i/2)%2?'0':'A';
+        char high=(i/2)%2?'9':i<2?'R':'X';
+        if(s[i]<low || s[i]>high) return 0;
+    }
+    return 1;
+}
+
+static int station_input_event(StationInput *input,App *a,const SDL_Event *e)
+{
+    if(e->type==SDL_QUIT) return 0;
+    if(!input->active) {
+        if(e->type!=SDL_KEYDOWN || e->key.keysym.sym!=SDLK_F7 || e->key.repeat) return 0;
+        *input=(StationInput){.active=1};
+        strcpy(input->my_call,a->my_call); strcpy(input->my_locator,a->my_locator);
+        SDL_StartTextInput(); return 1;
+    }
+    char *value=input->field?input->my_locator:input->my_call;
+    size_t capacity=input->field?sizeof(input->my_locator):sizeof(input->my_call);
+    if(e->type==SDL_TEXTINPUT) {
+        size_t n=strlen(value), extra=strlen(e->text.text);
+        if(n+extra>=capacity) { input->error="VALUE TOO LONG"; return 1; }
+        for(size_t i=0;i<extra;++i) {
+            char ch=e->text.text[i];
+            if(ch>='a' && ch<='z') ch-='a'-'A';
+            if((ch<'A' || ch>'Z') && (ch<'0' || ch>'9') && (input->field || (ch!='/' && ch!='-')))
+                return 1;
+        }
+        for(size_t i=0;i<extra;++i) {
+            char ch=e->text.text[i];
+            value[n+i]=ch>='a' && ch<='z'?ch-('a'-'A'):ch;
+        }
+        value[n+extra]=0; input->error=NULL;
+    } else if(e->type==SDL_MOUSEBUTTONDOWN && e->button.button==SDL_BUTTON_LEFT) {
+        if(e->button.x>=60 && e->button.x<900) {
+            if(e->button.y>=305 && e->button.y<345) input->field=0;
+            if(e->button.y>=375 && e->button.y<415) input->field=1;
+        }
+    } else if(e->type==SDL_KEYDOWN) {
+        SDL_Keycode key=e->key.keysym.sym;
+        if(key==SDLK_ESCAPE) { input->active=0; SDL_StopTextInput(); }
+        else if(key==SDLK_TAB || key==SDLK_UP || key==SDLK_DOWN) input->field=!input->field;
+        else if(key==SDLK_BACKSPACE) {
+            size_t n=strlen(value); if(n) value[n-1]=0;
+            input->error=NULL;
+        } else if(key==SDLK_a && (e->key.keysym.mod & KMOD_CTRL)) {
+            value[0]=0; input->error=NULL;
+        } else if(key==SDLK_RETURN || key==SDLK_KP_ENTER) {
+            if(!input->field) input->field=1;
+            else if(!valid_locator(input->my_locator))
+                input->error="MAIDENHEAD: USE 4, 6, 8 OR 10 CHARACTERS (E.G. JO22AA)";
+            else {
+                strcpy(a->my_call,input->my_call); strcpy(a->my_locator,input->my_locator);
+                input->active=0; SDL_StopTextInput();
+            }
+        }
+    }
+    return 1;
+}
 
 /* Input uses displayed MHz; reception always uses Hz after the converter. */
 static int parse_frequency(const char *value, double lo, double *hz)
@@ -348,7 +526,7 @@ typedef struct {
     Clipping clipping;
     int color_locked;
     uint64_t stack_skipped;
-    int mono_detect, stereo_detect, nicam_detect, audio_muted, audio_source;
+    int mono_detect, stereo_detect, nicam_detect, audio_muted, audio_source, audio_swap;
     uint32_t audio_metrics_tick;
     int stacking, stack_paused, stack_synced, sync_locked, free_sync, done, fm_mode;
     int afc_enabled, afc_state;
@@ -367,6 +545,9 @@ static void capture_view(App *a, View *v)
 {
     SDL_LockMutex(a->mutex);
     v->c=a->c;
+    v->c.invert=a->invert;
+    v->c.video_deemphasis=a->video_deemphasis;
+    v->c.experimental_sync=a->experimental_sync;
     memcpy(v->pixels,a->stacking && !a->stack.count?a->live:a->pixels,sizeof(v->pixels));
     if(a->stacking) memcpy(v->live,a->live,sizeof(v->live));
     memcpy(v->spectrum,a->spectrum,sizeof(v->spectrum));
@@ -380,6 +561,7 @@ static void capture_view(App *a, View *v)
     v->audio_metrics_tick=(uint32_t)SDL_AtomicGet(&a->audio_metrics_tick);
     v->audio_muted=SDL_AtomicGet(&a->audio_muted);
     v->audio_source=SDL_AtomicGet(&a->audio_source);
+    v->audio_swap=SDL_AtomicGet(&a->audio_swap);
     iq_recorder_status(a->recorder,&v->recording);
     COPY_VIEW(last_frame); COPY_VIEW(last_stacked); COPY_VIEW(power); COPY_VIEW(if_power_dbfs);
     COPY_VIEW(actual_hz); COPY_VIEW(actual_gain); COPY_VIEW(if_bandwidth); COPY_VIEW(line_hz);
@@ -408,6 +590,7 @@ static void reset_stack(App *a, unsigned target, int rolling)
     a->stack.target=target; a->stack.rolling=rolling;
     a->stack_pending=0; a->last_stacked=0;
     a->light_count=0;
+    a->stack_synced=0;
     ++a->stack_epoch; ++a->stack_reset_id;
     SDL_CondBroadcast(a->stack_ready);
 }
@@ -443,11 +626,12 @@ static void stack_action(App *a,int action)
 }
 static void queue_light_frame(App *a,const uint32_t *pixels)
 {
-    if(!a->light_count) memcpy(a->pixels,pixels,sizeof(a->pixels));
-    if(a->command || SDL_AtomicGet(&a->failed)) return;
+    int small=a->stacking && a->stack.rolling && a->c.rate<=10e6;
+    if(a->command || (small && a->stack_paused) || SDL_AtomicGet(&a->failed)) return;
+    if(small ? !a->stack.count : !a->light_count) memcpy(a->pixels,pixels,sizeof(a->pixels));
     if(a->stack_pending) ++a->stack_skipped;
     memcpy(a->queued.pixels,pixels,sizeof(a->queued.pixels));
-    a->queued.lightweight=1;
+    a->queued.lightweight=small?2:1;
     a->queued.serial=++a->light_input_serial;
     a->stack_pending=1;
     SDL_CondSignal(a->stack_ready);
@@ -459,6 +643,8 @@ static int stack_worker(void *opaque)
     StackFrame *input=malloc(sizeof(*input));
     uint32_t *output=calloc(WIDTH*HEIGHT,sizeof(*output));
     LightStack *light=NULL;
+    LiveStack *live=NULL;
+    unsigned live_reset=0,live_motion=0;
     uint64_t light_serial=0;
     unsigned reset=0,motion=0;
     if(!s || !input || !output) { SDL_AtomicSet(&a->failed,1); goto cleanup; }
@@ -469,7 +655,7 @@ static int stack_worker(void *opaque)
         if(!a->stack_pending) { SDL_UnlockMutex(a->mutex); break; }
         if(a->queued.lightweight) {
             memcpy(input->pixels,a->queued.pixels,sizeof(input->pixels));
-            input->lightweight=1; input->serial=a->queued.serial;
+            input->lightweight=a->queued.lightweight; input->serial=a->queued.serial;
         } else *input=a->queued;
         a->stack_pending=0; a->stack_busy=1;
         unsigned epoch=a->stack_epoch, next_reset=a->stack_reset_id, next_motion=a->stack_motion_id;
@@ -480,7 +666,15 @@ static int stack_worker(void *opaque)
         /* Neither reception nor rendering holds this accumulator's lock. */
         int configured=1;
         int added=0;
-        if(input->lightweight) {
+        if(input->lightweight==2) {
+            if(!live) live=calloc(1,sizeof(*live));
+            configured=live!=NULL;
+            if(live && (live_reset!=next_reset || live_motion!=next_motion || live->target!=target)) {
+                configured=live_stack_configure(live,target);
+                live_reset=next_reset; live_motion=next_motion;
+            }
+            if(configured) { live_stack_add(live,input->pixels,output); added=1; }
+        } else if(input->lightweight) {
             if(!light) {
                 light=malloc(sizeof(*light));
                 if(light) light_stack_reset(light);
@@ -510,7 +704,12 @@ static int stack_worker(void *opaque)
         }
 
         SDL_LockMutex(a->mutex);
-        if(epoch==a->stack_epoch && a->light_stacking && input->lightweight && !a->command) {
+        if(epoch==a->stack_epoch && a->stacking && a->stack.rolling && input->lightweight==2 && !a->stack_paused && !a->command) {
+            a->stack.count=live?live->count:0; a->stack.accepted=live?live->accepted:0;
+            a->stack.status="LIVE ROLLING"; a->stack_synced=0;
+            a->stack.confidence=0; a->stack.dx=a->stack.dy=a->stack.shear=0;
+            if(added) { memcpy(a->pixels,output,sizeof(a->pixels)); a->last_stacked=SDL_GetTicks(); }
+        } else if(epoch==a->stack_epoch && a->light_stacking && input->lightweight==1 && !a->command) {
             a->light_count=light?light->count:0;
             if(added) { memcpy(a->pixels,output,sizeof(a->pixels)); a->last_stacked=SDL_GetTicks(); }
         } else if(epoch==a->stack_epoch && a->stacking && !input->lightweight && !a->stack_paused && !a->command) {
@@ -529,6 +728,8 @@ static int stack_worker(void *opaque)
     }
 cleanup:
     if(s) stack_destroy(s);
+    if(live) live_stack_destroy(live);
+    free(live);
     free(s); free(input); free(output); free(light);
     SDL_LockMutex(a->mutex);
     a->stack_busy=0; a->stack_pending=0;
@@ -541,7 +742,7 @@ static void live_frame(void *opaque, const uint32_t *pixels)
     App *a=opaque;
     SDL_LockMutex(a->mutex);
     memcpy(a->live,pixels,sizeof(a->live));
-    if(a->light_stacking) queue_light_frame(a,pixels);
+    if(a->light_stacking || (a->stacking && a->stack.rolling && a->c.rate<=10e6)) queue_light_frame(a,pixels);
     else if(!a->stacking) memcpy(a->pixels,pixels,sizeof(a->pixels));
     SDL_UnlockMutex(a->mutex);
 }
@@ -556,15 +757,21 @@ static void frame(void *opaque, const uint32_t *pixels)
             SDL_CondWait(a->stack_ready,a->mutex);
     if(!a->decoder->preview) memcpy(a->live, pixels, sizeof(a->live));
     a->color_locked=a->decoder->pal.last_lock && a->decoder->tick-a->decoder->pal.last_lock<a->c.rate*.002;
-    a->sync_locked=a->decoder->hsync_updates && a->decoder->vsync_updates &&
-        a->decoder->fields-a->decoder->hsync_field<=5 &&
-        a->decoder->tick-a->decoder->vsync_confirmed<a->decoder->rate*.1;
+    a->have_hsync=a->decoder->hsync_updates!=0;
+    a->have_vsync=a->decoder->vsync_updates!=0;
+    a->horizontal_age_fields=a->decoder->fields-a->decoder->hsync_field;
+    a->vertical_age_ms=1000.0*(a->decoder->tick-a->decoder->vsync_confirmed)/a->decoder->rate;
+    uint32_t frame_tick=SDL_GetTicks();
+    sync_diagnostics_frame(a,frame_tick,
+        a->have_hsync && a->horizontal_age_fields<=5,
+        a->have_vsync && a->decoder->tick-a->decoder->vsync_confirmed<a->decoder->rate*.1);
     a->raster_hz=a->sync_locked && a->decoder->vsync_period>0?
         a->decoder->rate/a->decoder->vsync_period:0;
     int synced=a->decoder->hsync_updates && a->decoder->vsync_updates &&
         a->decoder->fields-a->decoder->hsync_field<=2 &&
         a->decoder->tick-a->decoder->vsync_confirmed<a->decoder->rate*.060;
-    if(!a->stack_paused && a->decoder->free_sync &&
+    int live_rolling=a->stacking && a->stack.rolling && a->c.rate<=10e6;
+    if(!live_rolling && !a->stack_paused && a->decoder->free_sync &&
        ((a->decoder->hsync_updates && !a->stack_hsync) ||
         (a->decoder->vsync_epoch && a->decoder->vsync_epoch!=a->stack_vsync) ||
         (synced && !a->stack_sync_input))) {
@@ -587,7 +794,7 @@ static void frame(void *opaque, const uint32_t *pixels)
      * completeness guard (also rejects acquisition transients) and let the
      * stack's structure/match checks reject noise. */
     if(!valid && !a->stack.count) clear_pending=1;
-    if(a->light_stacking) {
+    if(a->light_stacking || live_rolling) {
         if(!a->decoder->preview) queue_light_frame(a,a->live);
     }
     else if (!a->stacking) memcpy(a->pixels, a->live, sizeof(a->pixels));
@@ -612,17 +819,17 @@ static void frame(void *opaque, const uint32_t *pixels)
         a->stack_pending=1;
         SDL_CondSignal(a->stack_ready);
     }
-    a->last_frame = SDL_GetTicks(); ++a->frames;
+    a->last_frame = frame_tick; ++a->frames;
     SDL_UnlockMutex(a->mutex);
 }
 static void init_decoders(App *a, Decoder *d, Decoder *preview,
-                          int invert, int free_sync, double line_hz, int vertical_shift, double if_bw)
+                          int invert, int free_sync, double line_hz, int vertical_shift, double if_bw, int deemphasis, int experimental_sync)
 {
     decoder_init(d,a->c.rate,a->c.deviation,invert,frame,a);
     /* Both display modes use the adaptive sync clock, which keeps producing
      * rasters while searching/coasting. F only selects the independent live
      * preview versus the sync-following raster, not the legacy pulse gate. */
-    d->experimental_sync=a->c.experimental_sync;
+    d->experimental_sync=experimental_sync;
     d->free_sync=1; d->line_hz=line_hz; d->vertical_shift=vertical_shift;
     if(a->c.alignment_bandwidth>0)
         d->guide_stride=(unsigned)fmax(1,floor(a->c.rate/fmax(4e6,2*a->c.alignment_bandwidth)));
@@ -633,7 +840,7 @@ static void init_decoders(App *a, Decoder *d, Decoder *preview,
      * run only the independent live raster is visible; keep H/V recovery. */
     d->color=preview->color=color_enabled(a->c.rate,if_bw);
     pal_init(&d->pal,a->c.rate);
-    d->video_deemphasis=a->c.video_deemphasis;
+    d->video_deemphasis=deemphasis;
     d->no_guide_raster=stacking_limited(&a->c);
     d->no_video_raster=stacking_limited(&a->c) && free_sync;
 }
@@ -894,13 +1101,14 @@ static int worker(void *opaque)
     SDL_LockMutex(a->mutex);
     int initial_vertical_shift=a->vertical_shift;
     SDL_UnlockMutex(a->mutex);
-    init_decoders(a,d,preview,a->c.invert,a->c.free_sync,a->c.line_hz,initial_vertical_shift,a->c.if_bandwidth);
+    init_decoders(a,d,preview,a->c.invert,a->c.free_sync,a->c.line_hz,initial_vertical_shift,a->c.if_bandwidth,a->c.video_deemphasis,a->c.experimental_sync);
     a->decoder=d;
     video_path=alignment_create_video(a->c.rate,a->c.if_bandwidth,a->c.deviation,a->c.invert,a->c.rx_block,d->color);
     if(video_path && a->c.video_deemphasis && alignment_set_deemphasis(video_path)) {
         alignment_destroy(video_path); video_path=NULL;
     }
     if(!video_path) goto fail;
+    alignment_set_dc_block(video_path,iq_dc_block_enabled(&a->c));
     if(a->c.rate>=14e6) {
         audio.sound=sound_create(a->c.rate,play_audio,&audio);
         if(a->c.rate>=16e6) audio.stereo=stereo_sound_create(a->c.rate,play_stereo,&audio);
@@ -912,10 +1120,12 @@ static int worker(void *opaque)
     }
     if(a->c.experimental_sync) fprintf(stderr,"Experimental sync: echo-resistant line timing enabled\n");
     if(a->c.video_deemphasis) fprintf(stderr,"Video de-emphasis: PAL ITU-R F.405-1, linear phase; raw FM/NICAM audio preserved\n");
+    if(iq_dc_block_enabled(&a->c)) fprintf(stderr,"IQ DC rejection: 10 Hz, video and sync paths; raw IQ preserved; level measurements exclude DC\n");
     fprintf(stderr,"Video IF/FM: pipelined thread; PAL color automatic for IF >= 10 MHz at >= 12 MS/s\n");
     if(a->c.alignment_bandwidth>0) {
         alignment=alignment_create(a->c.rate,a->c.alignment_bandwidth,a->c.deviation,a->c.invert,a->c.rx_block);
         if(!alignment) goto fail;
+        alignment_set_dc_block(alignment,iq_dc_block_enabled(&a->c));
         fprintf(stderr,"Alignment IF/FM: dedicated thread, sample-aligned blocks\n");
     }
     alignment_set_fm_mode(video_path,a->c.fm_mode,a->c.invert);
@@ -924,6 +1134,7 @@ static int worker(void *opaque)
     AFC afc; afc_reset(&afc,a->c.rate,a->c.line_hz);
     unsigned afc_epoch=0;
     double applied_if = a->c.if_bandwidth;
+    int applied_deemphasis=a->c.video_deemphasis;
     uint64_t count = 0, next_fft = 0;
     SpectrumAverage spectrum_average={0};
     uint32_t start = SDL_GetTicks();
@@ -952,7 +1163,7 @@ static int worker(void *opaque)
         }
         if(SDL_AtomicGet(&a->stop)) { SDL_UnlockMutex(a->mutex); break; }
         int command = a->command, invert = a->invert, free_sync=a->free_sync, vertical_shift=a->vertical_shift;
-        int afc_enabled=a->afc_enabled, fm_mode=a->fm_mode;
+        int afc_enabled=a->afc_enabled, fm_mode=a->fm_mode, deemphasis=a->video_deemphasis, experimental_sync=a->experimental_sync;
         unsigned epoch=a->afc_epoch;
         double if_bw=a->if_bandwidth, line_hz=a->line_hz;
         double hz = a->requested_hz, gain = a->requested_gain;
@@ -989,16 +1200,18 @@ static int worker(void *opaque)
             publish_video_quality(a,&quality);
             video_scope_reset(&scope,line_hz);
             SDL_LockMutex(a->mutex); memset(&a->scope,0,sizeof(a->scope)); a->scope_tick=0; SDL_UnlockMutex(a->mutex);
-            init_decoders(a,d,preview,invert,free_sync,line_hz,vertical_shift,if_bw);
+            init_decoders(a,d,preview,invert,free_sync,line_hz,vertical_shift,if_bw,deemphasis,experimental_sync);
             if(alignment) alignment_reset(alignment,invert);
-            if (if_bw != applied_if) {
+            if (if_bw != applied_if || deemphasis != applied_deemphasis) {
                 alignment_destroy(video_path);
                 video_path=alignment_create_video(a->c.rate,if_bw,a->c.deviation,invert,a->c.rx_block,d->color);
-                if(video_path && a->c.video_deemphasis && alignment_set_deemphasis(video_path)) {
+                if(video_path && deemphasis && alignment_set_deemphasis(video_path)) {
                     alignment_destroy(video_path); video_path=NULL;
                 }
                 if(!video_path) goto fail;
+                alignment_set_dc_block(video_path,iq_dc_block_enabled(&a->c));
                 applied_if=if_bw;
+                applied_deemphasis=deemphasis;
             } else alignment_reset(video_path,invert);
             alignment_set_fm_mode(video_path,fm_mode,invert);
             if(alignment) alignment_set_fm_mode(alignment,fm_mode,invert);
@@ -1024,7 +1237,7 @@ static int worker(void *opaque)
             a->afc_state=0;
             a->last_frame = 0; interrupt_stack(a);
             SDL_UnlockMutex(a->mutex);
-            init_decoders(a,d,preview,invert,free_sync,line_hz,vertical_shift,if_bw);
+            init_decoders(a,d,preview,invert,free_sync,line_hz,vertical_shift,if_bw,deemphasis,experimental_sync);
             afc_reset(&afc,a->c.rate,line_hz);
             alignment_reset(video_path,invert);
             reset_audio(&audio,video_path,if_bw);
@@ -1049,8 +1262,7 @@ static int worker(void *opaque)
                 fprintf(stderr,"IQ recording captured %.3f seconds; saving on exit\n",record_count/a->c.rate);
         }
         if (count >= next_fft && n >= FFT_SIZE) {
-            double power = 0;
-            for (int j = 0; j < n; ++j) power += iq[j].i*iq[j].i + iq[j].q*iq[j].q;
+            double power=iq_ac_power_dbfs(iq,(size_t)n);
             for (int j = 0; j < FFT_SIZE; ++j) {
                 float w = .5f - .5f*cosf(2*PI*j/(FFT_SIZE-1));
                 in[j][0] = iq[j].i*w; in[j][1] = iq[j].q*w;
@@ -1059,7 +1271,7 @@ static int worker(void *opaque)
             SourceStats metrics;
             source_get_stats(a->source,&metrics);
             SDL_LockMutex(a->mutex);
-            a->rx_stats=metrics; a->metrics_tick=SDL_GetTicks();
+            a->rx_stats=metrics; a->metrics_tick=SDL_GetTicks(); a->consumed_samples=count;
             a->clipping=clipping;
             for (int j = 0; j < FFT_SIZE; ++j) {
                 int k = (j + FFT_SIZE/2) % FFT_SIZE;
@@ -1067,7 +1279,7 @@ static int worker(void *opaque)
                 a->spectrum[j] = p;
             }
             spectrum_average_update(&spectrum_average,a->spectrum,count,a->c.rate);
-            a->power = 10*log10(power/n + 1e-16);
+            a->power = power;
             SDL_UnlockMutex(a->mutex);
             next_fft = count + (uint64_t)(a->c.rate / 25);
         }
@@ -1108,7 +1320,7 @@ static int worker(void *opaque)
         if(ready && afc_enabled) {
             double error=0;
             /* PAL de-emphasis amplifies DC (and tuning error) by 11 dB. */
-            double hz_per_unit=a->c.deviation/(a->c.video_deemphasis?pow(10,11.0/20):1);
+            double hz_per_unit=a->c.deviation/(applied_deemphasis?pow(10,11.0/20):1);
             int measured=afc_measure(&afc,video,ready,hz_per_unit,invert,&error);
             if(measured) {
                 SDL_LockMutex(a->mutex);
@@ -1188,13 +1400,63 @@ static void detection_bar(SDL_Renderer *r,int y,const char *label,int enabled,in
     text(r,bar.x+8,y+25,!enabled?"UNAVAILABLE":detected?"DETECTED":"SEEKING",1);
 }
 
+enum {
+    CONTROL_IF, CONTROL_AFC, CONTROL_FM,
+    CONTROL_FREE_SYNC, CONTROL_EXP_SYNC, CONTROL_INVERSE, CONTROL_DEEMPH, CONTROL_SCOPE,
+    CONTROL_STACK, CONTROL_STACK_MODE, CONTROL_STACK_FRAMES, CONTROL_STACK_RESET, CONTROL_STACK_PAUSE,
+    CONTROL_SCREENSHOT, CONTROL_IQ, CONTROL_DIAG,
+    CONTROL_AUDIO, CONTROL_MUTE, CONTROL_SWAP,
+    CONTROL_SAVE, CONTROL_SETUP, CONTROL_STATION, CONTROL_INFO, CONTROL_COUNT
+};
+static const struct { const char *title; unsigned count; } control_groups[]={
+    {"TUNING",3}, {"VIDEO",5}, {"STACKING",5},
+    {"RECORDING",3}, {"AUDIO",3}, {"SETTINGS",4}
+};
+static const struct { SDL_Keycode key; SDL_Keymod modifiers; const char *label; } controls[]={
+    {SDLK_RIGHTBRACKET,KMOD_NONE,"[ ] VIDEO IF"}, {SDLK_c,KMOD_NONE,"C AFC"}, {SDLK_d,KMOD_NONE,"D FM MODE"},
+    {SDLK_f,KMOD_NONE,"F FREE SYNC"}, {SDLK_g,KMOD_NONE,"G EXP SYNC"}, {SDLK_i,KMOD_NONE,"I INVERSE"},
+    {SDLK_e,KMOD_NONE,"E DE-EMPH"}, {SDLK_o,KMOD_NONE,"O SCOPE"},
+    {SDLK_s,KMOD_NONE,"S STACK"}, {SDLK_m,KMOD_NONE,"M MODE"}, {SDLK_PLUS,KMOD_NONE,"FRAMES"}, {SDLK_r,KMOD_NONE,"R RESET"}, {SDLK_p,KMOD_SHIFT,"SHIFT+P"},
+    {SDLK_p,KMOD_NONE,"P SCREENSHOT"}, {SDLK_F9,KMOD_NONE,"F9 IQ"}, {SDLK_F10,KMOD_NONE,"F10 DIAG"},
+    {SDLK_n,KMOD_NONE,"N SOURCE"}, {SDLK_a,KMOD_NONE,"A MUTE"}, {SDLK_n,KMOD_SHIFT,"SHIFT+N L/R"},
+    {SDLK_w,KMOD_NONE,"W SAVE"}, {SDLK_x,KMOD_NONE,"X SETUP"}, {SDLK_F7,KMOD_NONE,"F7 MY ID"},
+    {SDLK_EXCLAIM,KMOD_NONE,"SHIFT+1 INFO"}
+};
+_Static_assert(sizeof(controls)/sizeof(*controls)==CONTROL_COUNT,"Every control needs a label and event");
+
+static SDL_Rect control_group_rect(unsigned group)
+{
+    int y=70;
+    for(unsigned i=0;i<group;++i) y+=24+50*((control_groups[i].count+2)/3)+18;
+    return (SDL_Rect){UI_WIDTH-UI_CONTROL_WIDTH+10,y,UI_CONTROL_WIDTH-20,
+        24+50*(int)((control_groups[group].count+2)/3)};
+}
 static SDL_Rect side_control_rect(int index)
 {
-    /* index -1 is the bandwidth display. Leave room for more controls. */
-    return (SDL_Rect){UI_WIDTH-UI_SIDE_WIDTH+10,65+52*(index+1),UI_SIDE_WIDTH-20,44};
+    if(index<0 || index>=CONTROL_COUNT) return (SDL_Rect){0,0,0,0};
+    unsigned offset=(unsigned)index,group=0;
+    while(offset>=control_groups[group].count) offset-=control_groups[group++].count;
+    SDL_Rect frame=control_group_rect(group);
+    int width=(frame.w-20-12)/3;
+    return (SDL_Rect){frame.x+10+(int)(offset%3)*(width+6),frame.y+16+(int)(offset/3)*50,width,44};
 }
-
-static void side_control(SDL_Renderer *r,int index,const char *label,const char *value,int state)
+static void draw_control_groups(SDL_Renderer *r)
+{
+    SDL_Rect panel={UI_WIDTH-UI_CONTROL_WIDTH,65,UI_CONTROL_WIDTH,UI_HEIGHT-65};
+    SDL_SetRenderDrawColor(r,19,27,39,255); SDL_RenderFillRect(r,&panel);
+    for(unsigned i=0;i<sizeof(control_groups)/sizeof(*control_groups);++i) {
+        SDL_Rect frame=control_group_rect(i);
+        int label_x=frame.x+14, label_end=label_x+(int)strlen(control_groups[i].title)*8;
+        SDL_SetRenderDrawColor(r,245,245,245,255);
+        SDL_RenderDrawLine(r,frame.x,frame.y,label_x-6,frame.y);
+        SDL_RenderDrawLine(r,label_end+6,frame.y,frame.x+frame.w-1,frame.y);
+        SDL_RenderDrawLine(r,frame.x,frame.y,frame.x,frame.y+frame.h-1);
+        SDL_RenderDrawLine(r,frame.x+frame.w-1,frame.y,frame.x+frame.w-1,frame.y+frame.h-1);
+        SDL_RenderDrawLine(r,frame.x,frame.y+frame.h-1,frame.x+frame.w-1,frame.y+frame.h-1);
+        text(r,label_x,frame.y-7,control_groups[i].title,2);
+    }
+}
+static void side_control(SDL_Renderer *r,int index,const char *value,int state)
 {
     SDL_Rect bar=side_control_rect(index);
     if(state==3) SDL_SetRenderDrawColor(r,65,72,82,255);
@@ -1203,33 +1465,40 @@ static void side_control(SDL_Renderer *r,int index,const char *label,const char 
     else SDL_SetRenderDrawColor(r,24,83,170,255);
     SDL_RenderFillRect(r,&bar);
     SDL_SetRenderDrawColor(r,state==3?165:255,state==3?172:255,state==3?182:255,255);
-    text(r,bar.x+8,bar.y+7,label,2);
-    text(r,bar.x+8,bar.y+25,value,2);
+    text(r,bar.x+6,bar.y+7,controls[index].label,2);
+    text(r,bar.x+6,bar.y+25,value,2);
 }
 
 /* Events have already been translated into centre-panel coordinates. */
-static SDL_Keycode side_control_key(const SDL_Event *e)
+static int side_control_event(SDL_Event *e)
 {
-    if(e->type!=SDL_MOUSEBUTTONDOWN || e->button.button!=SDL_BUTTON_LEFT) return SDLK_UNKNOWN;
-    const SDL_Keycode keys[]={SDLK_c,SDLK_s,SDLK_w,SDLK_a,SDLK_n,SDLK_EXCLAIM,SDLK_F9,SDLK_f,SDLK_m,SDLK_d};
+    if(e->type!=SDL_MOUSEBUTTONDOWN || e->button.button!=SDL_BUTTON_LEFT) return 0;
     SDL_Point point={e->button.x+UI_SIDE_WIDTH,e->button.y};
-    for(size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) {
+    for(int i=0;i<CONTROL_COUNT;++i) {
         SDL_Rect rect=side_control_rect(i);
-        if(SDL_PointInRect(&point,&rect)) return keys[i];
+        if(!SDL_PointInRect(&point,&rect)) continue;
+        SDL_Keycode key=controls[i].key;
+        if(i==CONTROL_IF && point.x<rect.x+rect.w/2) key=SDLK_LEFTBRACKET;
+        if(i==CONTROL_STACK_FRAMES && point.x<rect.x+rect.w/2) key=SDLK_MINUS;
+        SDL_zero(*e); e->type=SDL_KEYDOWN;
+        e->key.keysym.sym=key; e->key.keysym.mod=controls[i].modifiers;
+        return 1;
     }
-    return SDLK_UNKNOWN;
+    return 0;
 }
 
-static void draw_side_panels(SDL_Renderer *r,const View *v,uint32_t save_notice,int save_result)
+static void draw_side_panels(SDL_Renderer *r,const View *v,uint32_t save_notice,int save_result,uint32_t screenshot_notice,uint32_t if_notice)
 {
+    SDL_SetRenderDrawColor(r,160,205,235,255);
+    text(r,UI_WIDTH-150,8,"V" ATV_VERSION,2);
+    text(r,UI_WIDTH-150,28,"COMMIT",2);
+    text(r,UI_WIDTH-150,46,ATV_GIT_COMMIT,2);
     uint32_t now=SDL_GetTicks();
     int fresh_video=v->last_frame && now-v->last_frame<150;
     int fresh_audio=v->audio_metrics_tick && now-v->audio_metrics_tick<1000;
     SDL_Rect panel={0,65,UI_SIDE_WIDTH,740};
     SDL_SetRenderDrawColor(r,19,27,39,255); SDL_RenderFillRect(r,&panel);
-    panel.x=UI_WIDTH-UI_SIDE_WIDTH;
-    panel.h=side_control_rect(9).y+side_control_rect(9).h-panel.y;
-    SDL_RenderFillRect(r,&panel);
+    draw_control_groups(r);
     detection_bar(r,65,"SYNC",1,fresh_video && v->sync_locked);
     detection_bar(r,117,"COLOR BURST",color_enabled(v->c.rate,v->if_bandwidth),fresh_video && v->color_locked);
     int audio_enabled=sound_enabled(v->c.rate,v->if_bandwidth);
@@ -1241,7 +1510,13 @@ static void draw_side_panels(SDL_Renderer *r,const View *v,uint32_t save_notice,
         detection_bar(r,273+52*k,carriers[k],stereo_enabled,fresh_audio && (v->stereo_detect & (1<<k)));
 
     SDL_Rect frames={10,481,UI_SIDE_WIDTH-20,52};
-    SDL_SetRenderDrawColor(r,24,83,170,255); SDL_RenderFillRect(r,&frames);
+    int stack_progress=(v->stacking || v->light_stacking) &&
+        v->stack.target && v->stack.count;
+    if(stack_progress && v->stack.count>=v->stack.target)
+        SDL_SetRenderDrawColor(r,22,130,72,255);
+    else if(stack_progress) SDL_SetRenderDrawColor(r,190,35,40,255);
+    else SDL_SetRenderDrawColor(r,24,83,170,255);
+    SDL_RenderFillRect(r,&frames);
     SDL_SetRenderDrawColor(r,255,255,255,255);
     text(r,frames.x+8,frames.y+6,"FRAMES",2);
     char frame_count[32];
@@ -1274,8 +1549,8 @@ static void draw_side_panels(SDL_Renderer *r,const View *v,uint32_t save_notice,
     text(r,timing.x+8,timing.y+41,"RASTER",2);
     if(fresh_video && v->sync_locked && v->raster_hz>0 && isfinite(v->raster_hz)) {
         snprintf(frequency,sizeof(frequency),"%.2f HZ",v->raster_hz);
-        text(r,timing.x+8,timing.y+59,frequency,2);
-    }
+    } else snprintf(frequency,sizeof(frequency),"NO LOCK");
+    text(r,timing.x+8,timing.y+59,frequency,2);
 
     SDL_Rect if_level={10,677,UI_SIDE_WIDTH-20,44};
     SDL_SetRenderDrawColor(r,24,83,170,255); SDL_RenderFillRect(r,&if_level);
@@ -1291,48 +1566,54 @@ static void draw_side_panels(SDL_Renderer *r,const View *v,uint32_t save_notice,
     SDL_Rect counters={10,729,UI_SIDE_WIDTH-20,76};
     SDL_SetRenderDrawColor(r,24,83,170,255); SDL_RenderFillRect(r,&counters);
     SDL_SetRenderDrawColor(r,255,255,255,255);
-    text(r,counters.x+8,counters.y+7,"FIELDS",2);
+    text(r,counters.x+8,counters.y+7,"FRAMES",2);
     snprintf(status,sizeof(status),"%u",v->frames);
     text(r,counters.x+8,counters.y+25,status,2);
     text(r,counters.x+8,counters.y+41,"DROPS",2);
     snprintf(status,sizeof(status),"%u",v->overflows);
     text(r,counters.x+8,counters.y+59,status,2);
 
-    SDL_Rect bandwidth=side_control_rect(-1);
-    SDL_SetRenderDrawColor(r,24,83,170,255); SDL_RenderFillRect(r,&bandwidth);
-    SDL_SetRenderDrawColor(r,255,255,255,255);
-    text(r,bandwidth.x+8,bandwidth.y+7,"VIDEO IF",2);
     char label[32];
-    snprintf(label,sizeof(label),"%.2f MHZ",v->if_bandwidth/1e6);
-    text(r,bandwidth.x+8,bandwidth.y+25,label,2);
-
+    snprintf(label,sizeof(label),"- %.2fM +",v->if_bandwidth/1e6);
+    side_control(r,CONTROL_IF,label,if_notice && now-if_notice<500?1:0);
     int can_afc=strcmp(v->c.mode,"file") && strcmp(v->c.mode,"demo");
     const char *afc=!can_afc?"N/A":!v->afc_enabled?"OFF":
         v->afc_state==1?"TRACK":v->afc_state==2?"LIMIT":"SEEK";
-    if(v->afc_enabled) {
+    if(can_afc && v->afc_enabled) {
         snprintf(label,sizeof(label),"%s %+.0fK",afc,(v->actual_hz-v->afc_anchor)/1e3);
         afc=label;
     }
-    side_control(r,0,"C AFC",afc,v->afc_enabled);
+    side_control(r,CONTROL_AFC,afc,!can_afc?3:v->afc_enabled);
+    side_control(r,CONTROL_FM,v->fm_mode?"FM1":"FM0",0);
+    side_control(r,CONTROL_FREE_SYNC,v->free_sync?"ON":"OFF",v->free_sync);
+    side_control(r,CONTROL_EXP_SYNC,v->c.experimental_sync?"ON":"OFF",v->c.experimental_sync);
+    side_control(r,CONTROL_INVERSE,v->c.invert?"ON":"OFF",v->c.invert);
+    side_control(r,CONTROL_DEEMPH,v->c.video_deemphasis?"ON":"OFF",v->c.video_deemphasis);
+    side_control(r,CONTROL_SCOPE,v->scope_enabled?"SCOPE":"TV",v->scope_enabled);
     int stacking=v->stacking || v->light_stacking;
-    side_control(r,1,"S STACK",v->light_stacking?"6 ON":stacking?"ON":"OFF",stacking);
-    int saved=save_notice && now-save_notice<1500;
-    side_control(r,2,"W SAVE",saved?(save_result?"SAVED":"FAILED"):"SETTINGS",saved?(save_result?1:2):0);
-    side_control(r,3,"A MUTE",v->audio_muted?"ON":"OFF",v->audio_muted?2:0);
-    const char *sources[]={"FM 6 MHZ","NICAM","7.02/7.22","7.38/7.56"};
-    side_control(r,4,"N AUDIO",sources[v->audio_source & 3],audio_enabled?0:3);
-    side_control(r,5,"SHIFT+1","INFO",0);
+    int light_controls=v->c.rate>10e6 && !v->stacking;
+    side_control(r,CONTROL_STACK,v->light_stacking?"6 ON":stacking?"ON":"OFF",stacking);
+    side_control(r,CONTROL_STACK_MODE,light_controls?"ROLLING 6":v->stack.rolling?"ROLLING":"FIXED",light_controls?3:v->stack.rolling);
+    snprintf(label,sizeof(label),"- %u +",v->stack.target);
+    side_control(r,CONTROL_STACK_FRAMES,light_controls?"- 6 +":label,light_controls?3:0);
+    side_control(r,CONTROL_STACK_RESET,light_controls?"N/A":"CLEAR",light_controls?3:0);
+    side_control(r,CONTROL_STACK_PAUSE,light_controls?"N/A":v->stack_paused?"RESUME":"PAUSE",light_controls?3:v->stack_paused?2:0);
+    side_control(r,CONTROL_SCREENSHOT,"SAVE PNG",screenshot_notice && now-screenshot_notice<500?1:0);
     IQRecordState recording=v->recording.state;
     const char *record_label=recording==IQ_REC_PREPARING?"PREPARING":
         recording==IQ_REC_CAPTURING?"RECORDING":recording==IQ_REC_SAVING?"SAVING":
         recording==IQ_REC_SAVED?"SAVED":recording==IQ_REC_ERROR?"ERROR":"RECORD";
-    side_control(r,6,"F9 IQ",record_label,
-        recording==IQ_REC_ERROR?2:recording==IQ_REC_PREPARING || recording==IQ_REC_CAPTURING?1:0);
-    side_control(r,7,"F FREE SYNC",v->free_sync?"ON":"OFF",v->free_sync);
-    int light_controls=v->c.rate>10e6 && !v->stacking;
-    side_control(r,8,"M STACK",light_controls?"ROLLING 6":v->stack.rolling?"ROLLING":"FIXED",
-        light_controls?3:v->stack.rolling?1:0);
-    side_control(r,9,"D FM",v->fm_mode?"FM1":"FM0",0);
+    side_control(r,CONTROL_IQ,record_label,recording==IQ_REC_ERROR?2:recording==IQ_REC_PREPARING || recording==IQ_REC_CAPTURING?1:0);
+    side_control(r,CONTROL_DIAG,"30 SEC + PNG",0);
+    const char *sources[]={"FM 6 MHZ","NICAM","7.02/7.22","7.38/7.56"};
+    side_control(r,CONTROL_AUDIO,sources[v->audio_source & 3],audio_enabled?0:3);
+    side_control(r,CONTROL_MUTE,v->audio_muted?"ON":"OFF",v->audio_muted?2:0);
+    side_control(r,CONTROL_SWAP,v->audio_swap?"R / L":"L / R",stereo_enabled && v->audio_source>=2?v->audio_swap:3);
+    int saved=save_notice && now-save_notice<1500;
+    side_control(r,CONTROL_SAVE,saved?(save_result?"SAVED":"FAILED"):"SETTINGS",saved?(save_result?1:2):0);
+    side_control(r,CONTROL_SETUP,"SDR SETTINGS",0);
+    side_control(r,CONTROL_STATION,"CALL / LOC",0);
+    side_control(r,CONTROL_INFO,"CONTROLS",0);
 }
 typedef struct {
     SDL_Renderer *renderer;
@@ -1355,7 +1636,7 @@ static void draw_wizard(SDL_Renderer *r,const SettingsPrompt *q,const char *inpu
     SDL_SetRenderDrawColor(r,90,210,180,255);
     text(r,40,32,"FM ATV - STARTUP CONFIGURATION",4);
     SDL_SetRenderDrawColor(r,140,155,170,255);
-    text(r,40,70,"VERSION " ATV_VERSION "   " ATV_BUILD_UTC " UTC",2);
+    text(r,40,70,"VERSION " ATV_VERSION "   COMMIT " ATV_GIT_COMMIT,2);
     SDL_SetRenderDrawColor(r,235,240,245,255);
     text(r,40,120,q->title,3);
     if(q->kind==SETTINGS_HARDWARE && drivers) {
@@ -1374,26 +1655,34 @@ static void draw_wizard(SDL_Renderer *r,const SettingsPrompt *q,const char *inpu
         text(r,40,394,"Type 1, 2, 3 or 4 and press Enter.",2);
         text(r,40,422,"Continuous RX guidance; actual rate depends on PC and connection.",2);
         text(r,40,450,"FM 6 MHz / NICAM needs >=14 MS/s AND >=14 MHz video IF.",2);
-    } else wizard_lines(r,40,178,q->details,14);
+    } else wizard_lines(r,40,178,q->details,q->kind==SETTINGS_MENU?18:14);
     SDL_SetRenderDrawColor(r,160,205,235,255);
-    text(r,40,500,"CURRENT VALUE:",2);
-    wizard_lines(r,40,525,*q->current?q->current:"-",2);
-    SDL_Rect box={40,580,880,44};
+    if(q->kind!=SETTINGS_MENU) {
+        text(r,40,500,"CURRENT VALUE:",2);
+        wizard_lines(r,40,525,*q->current?q->current:"-",2);
+    }
+    int input_y=q->kind==SETTINGS_MENU?600:580;
+    SDL_Rect box={40,input_y,880,44};
     SDL_SetRenderDrawColor(r,35,49,65,255); SDL_RenderFillRect(r,&box);
     SDL_SetRenderDrawColor(r,235,240,245,255);
     char visible[108]; size_t len=strlen(input);
     snprintf(visible,sizeof(visible),"%s_",input+(len>104?len-104:0));
-    text(r,50,595,visible,2);
+    text(r,50,input_y+15,visible,2);
     SDL_SetRenderDrawColor(r,255,170,110,255);
     wizard_lines(r,40,654,*error?error:q->error,2);
     SDL_Rect next={40,730,320,46}, cancel={380,730,320,46};
     SDL_SetRenderDrawColor(r,45,65,80,255); SDL_RenderFillRect(r,&next); SDL_RenderFillRect(r,&cancel);
     SDL_SetRenderDrawColor(r,235,240,245,255);
-    text(r,55,745,(q->kind==SETTINGS_WELCOME)?"SET UP":"CONTINUE - ENTER",2);
+    text(r,55,745,(q->kind==SETTINGS_WELCOME)?"SET UP":q->kind==SETTINGS_MENU?"START - ENTER":"CONTINUE - ENTER",2);
     text(r,395,745,(q->kind==SETTINGS_WELCOME)?"SKIP - ENTER":"EXIT - ESC",2);
+    if(q->kind==SETTINGS_MENU) {
+        SDL_Rect save={720,730,200,46};
+        SDL_SetRenderDrawColor(r,45,65,80,255); SDL_RenderFillRect(r,&save);
+        SDL_SetRenderDrawColor(r,235,240,245,255); text(r,735,745,"SAVE - W",2);
+    }
     SDL_SetRenderDrawColor(r,140,155,170,255);
     text(r,40,805,"BACKSPACE: DELETE CHARACTER   CTRL+A: CLEAR FIELD   CTRL+V: PASTE",2);
-    text(r,40,837,"AFTER SETUP: PRESS W ON THE MAIN SCREEN TO SAVE ALL SETTINGS",2);
+    text(r,40,837,"W: SAVE SETTINGS AND THIS SDR PROFILE",2);
 }
 static int graphical_prompt(void *opaque,const SettingsPrompt *q,char *line,size_t n)
 {
@@ -1425,13 +1714,33 @@ static int graphical_prompt(void *opaque,const SettingsPrompt *q,char *line,size
                 }
             }
             if(e.type==SDL_TEXTINPUT) {
+                if(q->kind==SETTINGS_MENU && (!strcmp(e.text.text,"w") || !strcmp(e.text.text,"W"))) {
+                    snprintf(line,n,"w"); SDL_StopTextInput(); return 1;
+                }
                 if(strlen(line)+strlen(e.text.text)<n) { strcat(line,e.text.text); error=""; }
                 else error="INPUT TOO LONG. USE BACKSPACE OR CTRL+A.";
+            }
+            if(e.type==SDL_MOUSEBUTTONDOWN && e.button.button==SDL_BUTTON_LEFT && e.button.x>=40 && e.button.x<920) {
+                if(q->kind==SETTINGS_HARDWARE && e.button.y>=190 && e.button.y<374) {
+                    snprintf(line,n,"%d",1+(e.button.y-190)/46);
+                    SDL_StopTextInput(); return 1;
+                }
+                if(q->kind==SETTINGS_MENU && e.button.y>=178 && e.button.y<574) {
+                    int row=(e.button.y-178)/22; const char *entry=q->details;
+                    while(row-- && *entry) { const char *next=strchr(entry,'\n'); entry=next?next+1:entry+strlen(entry); }
+                    int choice;
+                    if(sscanf(entry,"%d.",&choice)==1) {
+                        snprintf(line,n,"%d",choice); SDL_StopTextInput(); return 1;
+                    }
+                }
             }
             if(e.type==SDL_MOUSEBUTTONDOWN && e.button.button==SDL_BUTTON_LEFT && e.button.y>=730 && e.button.y<776) {
                 if(e.button.x>=40 && e.button.x<360) {
                     if((q->kind==SETTINGS_WELCOME)) snprintf(line,n,"w");
                     SDL_StopTextInput(); return 1;
+                }
+                if(q->kind==SETTINGS_MENU && e.button.x>=720 && e.button.x<920) {
+                    snprintf(line,n,"w"); SDL_StopTextInput(); return 1;
                 }
                 if(e.button.x>=380 && e.button.x<700) {
                     line[0]=0; SDL_StopTextInput(); return (q->kind==SETTINGS_WELCOME)?1:0;
@@ -1610,6 +1919,26 @@ static void draw_iq_recording(SDL_Renderer *r,const IQRecordStatus *s,const char
     text(r,130,595,warning?warning:s->state==IQ_REC_ERROR?s->error:s->path,1);
 }
 
+static void draw_diagnosis(SDL_Renderer *r,DiagnosticLog *log)
+{
+    int state=diagnostic_log_state(log);
+    if(state==DIAG_IDLE) return;
+    char button_value[32];
+    if(state==DIAG_RECORDING) snprintf(button_value,sizeof(button_value),"%u SEC LEFT",diagnostic_log_remaining(log));
+    else snprintf(button_value,sizeof(button_value),"%s",state==DIAG_SAVING?"SAVING":state==DIAG_SAVED?"SAVED":"ERROR");
+    side_control(r,CONTROL_DIAG,button_value,state==DIAG_ERROR?2:1);
+    char label[512];
+    if(state==DIAG_RECORDING) snprintf(label,sizeof(label),"F10 DIAGNOSIS: %u SEC LEFT - F10 STOPS",diagnostic_log_remaining(log));
+    else if(state==DIAG_SAVING) snprintf(label,sizeof(label),"DIAGNOSIS: SAVING TEXT FILE...");
+    else if(state==DIAG_SAVED) {
+        const char *path=diagnostic_log_path(log), *name=strrchr(path,'/');
+        snprintf(label,sizeof(label),"SAVED %s + INITIAL PNG | SHIFT+F10: COPY TXT PATH",name?name+1:path);
+    } else snprintf(label,sizeof(label),"DIAGNOSIS: %s",diagnostic_log_error(log));
+    SDL_Rect bar={UI_SIDE_WIDTH+10,810,940,20};
+    SDL_SetRenderDrawColor(r,state==DIAG_ERROR?130:20,35,50,255); SDL_RenderFillRect(r,&bar);
+    SDL_SetRenderDrawColor(r,235,245,255,255); text(r,bar.x+5,bar.y+5,label,1);
+}
+
 static void draw_info_screen(SDL_Renderer *r, const Config *c)
 {
     static const struct { const char *key, *description; } commands[]={
@@ -1618,19 +1947,21 @@ static void draw_info_screen(SDL_Renderer *r, const Config *c)
         {"UP / DOWN", "INCREASE / DECREASE RECEIVE GAIN BY 1 DB"},
         {"T", "ENTER FREQUENCY IN MHZ, INCLUDING CONVERTER LO"},
         {"O", "SWITCH TV PICTURE / VIDEO OSCILLOSCOPE"},
-        {"F9", "START / STOP RAW IQ RECORDING (DEFAULT 3 SECONDS)"},
+        {"F9 / F10", "IQ RECORDING / DIAGNOSIS TXT (30 SEC); PRESS AGAIN TO STOP"},
+        {"SHIFT+F10", "COPY SAVED DIAGNOSIS FILE PATH"},
+        {"F7", "EDIT MY CALLSIGN AND LOCATOR"},
         {"ENTER / ESC", "DURING FREQUENCY ENTRY: TUNE / CANCEL"},
         {"BACKSPACE / CTRL+A", "DURING FREQUENCY ENTRY: DELETE CHARACTER / CLEAR FIELD"},
-        {"W", "SAVE CURRENT SETTINGS AS STARTUP CONFIGURATION"},
+        {"W / X", "SAVE SETTINGS AND SDR PROFILE / RETURN TO SETUP"},
         {"C", "AFC ON / OFF: TRACK SIGNAL WITHIN +/-500 KHZ (LIVE SDR)"},
         {"I", "INVERT FM VIDEO POLARITY"},
-        {"D", "SWITCH FM0 / FM1 FOR VIDEO AND ALIGNMENT"},
-        {"F", "FREE-RUNNING VIDEO SYNC ON / OFF"},
+        {"D / E", "SWITCH FM0 / FM1; PAL VIDEO DE-EMPHASIS ON / OFF"},
+        {"F / G", "FREE SYNC / EXPERIMENTAL ECHO-RESISTANT SYNC ON / OFF"},
         {"[ / ]", "DECREASE / INCREASE VIDEO IF BANDWIDTH BY 1 MHZ"},
         {", / .", "DECREASE / INCREASE LINE FREQUENCY BY 0.1 HZ"},
         {"B / V", "SHIFT VERTICAL IMAGE POSITION BY ONE STEP"},
         {"S", "STACK ON / OFF; ABOVE 10 MS/S: ROLLING 6, FULL PICTURE"},
-        {"- / +", "DECREASE / INCREASE NUMBER OF FIELDS TO STACK"},
+        {"- / +", "DECREASE / INCREASE NUMBER OF FRAMES TO STACK"},
         {"R", "RESTART STACK"},
         {"M", "SWITCH FIXED / ROLLING STACKING"},
         {"SHIFT+P", "PAUSE / RESUME STACKING"},
@@ -1646,7 +1977,7 @@ static void draw_info_screen(SDL_Renderer *r, const Config *c)
     SDL_SetRenderDrawColor(r,90,210,180,255);
     text(r,40,28,"FM ATV - INFO AND CONTROLS",4);
     SDL_SetRenderDrawColor(r,225,235,245,255);
-    text(r,40,60,"VERSION " ATV_VERSION "   BUILT " ATV_BUILD_UTC " UTC",2);
+    text(r,40,60,"VERSION " ATV_VERSION "   COMMIT " ATV_GIT_COMMIT,2);
     text(r,40,78,"PURPOSE: RECEIVE ANALOG FM AMATEUR TELEVISION WITH AN SDR.",2);
     SDL_SetRenderDrawColor(r,160,205,235,255);
     text(r,40,104,"STACK: CONTEST AT <=10 MS/S; ABOVE 10 MS/S: LIGHT ROLLING 6, RGB.",2);
@@ -1665,7 +1996,7 @@ static void draw_info_screen(SDL_Renderer *r, const Config *c)
     SDL_SetRenderDrawColor(r,140,155,170,255);
     if(!strcmp(c->mode,"hackrf")) {
         char gain_info[128];
-        snprintf(gain_info,sizeof(gain_info),"HACKRF: RX VGA %.0f DB FIXED; RF AMP ON (14 DB). UP/DOWN: RX LNA.",c->hackrf_vga);
+        snprintf(gain_info,sizeof(gain_info),"HACKRF: RX VGA %.0f DB FIXED; RF AMP %s. UP/DOWN: RX LNA.",c->hackrf_vga,c->hackrf_amp?"ON (14 DB)":"OFF");
         text(r,40,784,gain_info,2);
     }
     text(r,40,804,"FILE / DEMO: FRAME STACKING IS ALSO AVAILABLE ABOVE 10 MS/S.",2);
@@ -1780,7 +2111,9 @@ static void help(void)
          "  --rx-block N           samples per receive call, 2048..1048576 (B210: 16384; Pluto: 131072; others: 32768)\n"
          "  --bandwidth HZ         default 18000000\n"
          "  --gain DB              default 30; HackRF RX LNA 0..40 in 8 dB steps\n"
-         "  --hackrf-vga DB        fixed RX VGA, default 28 (0..62, step 2); RF AMP on\n"
+         "  --hackrf-amp 0|1       RF preamp off/on (default on)\n"
+         "  --hackrf-vga DB        fixed RX VGA, default 12 (0..62, step 2)\n"
+         "  --iq-dc-block MODE     auto (HackRF only, default), on or off; IQ DC rejection before FM\n"
          "  --deviation HZ         Test/file video scale in Hz (default 4000000)\n"
          "  --video-deemphasis MODE PAL F.405-1 linear-phase correction: pal or off (default pal)\n"
          "  --if-bandwidth HZ      digital IF width (default 18000000); auto PAL color >= 10 MHz at >= 12 MS/s\n"
@@ -1807,6 +2140,9 @@ static void help(void)
          "Controls: left/right or wheel = 100 kHz, Shift = 1 MHz, Ctrl = 10 kHz;\n"
          "C = AFC on/off (+/-500 kHz, live SDR); T = type frequency in MHz, Enter = tune, Esc = cancel; up/down = gain 1 dB; I = invert; click spectrum = tune; Q / Esc = quit.\n"
          "[ / ] = IF narrower/wider by 1 MHz; O = TV / video oscilloscope; F = free sync; , / . = line clock -/+ 0.1 Hz; B/V = vertical position.\n"
+         "E = PAL video de-emphasis on/off (default on); G = experimental sync on/off (default off).\n"
+         "X = return to SDR setup (restarts reception after configuration).\n"
+         "F7 = edit callsign/locator; F10 = start/stop 30-second diagnosis TXT; Shift+F10 = copy saved path.\n"
          "F9 = start/stop raw IQ recording with settings; auto-saves after --record-seconds (default 3).\n"
          "S = stack on/off (above 10 MS/s: light RGB rolling 6, full picture); -/+ = contest stack size; R = reset; M = fixed/rolling; P = averaged PNG; Ctrl+P = single image; Shift+P = contest pause/resume.");
 }
@@ -1822,6 +2158,8 @@ static void current_settings(App *a, Settings *s)
     s->c=a->c;
     s->c.frequency=a->requested_hz+a->c.lo; s->c.gain=a->requested_gain;
     s->c.fm_mode=a->fm_mode;
+    s->c.video_deemphasis=a->video_deemphasis;
+    s->c.experimental_sync=a->experimental_sync;
     s->c.invert=a->invert; s->c.free_sync=a->free_sync;
     s->c.if_bandwidth=a->if_bandwidth; s->c.line_hz=a->line_hz;
     s->stacking=a->stacking; s->stack_frames=(int)a->stack.target;
@@ -1831,6 +2169,19 @@ static void current_settings(App *a, Settings *s)
     s->audio_source=SDL_AtomicGet(&a->audio_source);
     s->audio_muted=SDL_AtomicGet(&a->audio_muted);
     s->audio_swap=SDL_AtomicGet(&a->audio_swap);
+    strcpy(s->my_call,a->my_call); strcpy(s->my_locator,a->my_locator);
+}
+static void apply_settings(App *a,const Settings *s)
+{
+    a->c=s->c;
+    strcpy(a->my_call,s->my_call); strcpy(a->my_locator,s->my_locator);
+    a->stacking=s->stacking; a->stack_paused=s->paused;
+    a->light_stacking=s->light_stacking;
+    a->vertical_shift=s->vertical_shift;
+    SDL_AtomicSet(&a->audio_source,s->audio_source);
+    SDL_AtomicSet(&a->audio_muted,s->audio_muted);
+    SDL_AtomicSet(&a->audio_swap,s->audio_swap);
+    stack_reset(&a->stack, (unsigned)s->stack_frames);
 }
 static int atv_main(int argc, char **argv)
 {
@@ -1839,7 +2190,7 @@ static int atv_main(int argc, char **argv)
     a->if_power_dbfs=NAN;
     a->c = (Config){.mode="demo", .args="", .video_deemphasis=1, .images=ATV_DEFAULT_IMAGES,
         .status_bind="127.0.0.1", .status_port=8765,
-        .antenna="TX/RX", .ref="internal", .rate=20e6, .frequency=1252e6, .bandwidth=18e6, .gain=30, .hackrf_vga=28, .deviation=4e6, .if_bandwidth=18e6, .line_hz=15625, .rx_block=0, .record_seconds=3, .alignment_bandwidth=3200000};
+        .antenna="TX/RX", .ref="internal", .rate=20e6, .frequency=1252e6, .bandwidth=18e6, .gain=30, .hackrf_vga=12, .hackrf_amp=1, .deviation=4e6, .if_bandwidth=18e6, .line_hz=15625, .rx_block=0, .record_seconds=3, .alignment_bandwidth=3200000};
     char config_path[4096];
 #ifdef _WIN32
     char *pref=SDL_GetPrefPath("PE1ITR","ATV Receiver");
@@ -1854,7 +2205,7 @@ static int atv_main(int argc, char **argv)
     int load_config=1, required_config=0, wizard=1;
     /* Read configuration before CLI options, so explicit options take precedence. */
     for(int j=1;j<argc;++j) {
-        if(!strcmp(argv[j],"--version")) { printf("FM ATV %s (built %s UTC)\n",ATV_VERSION,ATV_BUILD_UTC); free(a); return 0; }
+        if(!strcmp(argv[j],"--version")) { printf("FM ATV %s (commit %s, built %s UTC)\n",ATV_VERSION,ATV_GIT_COMMIT,ATV_BUILD_UTC); free(a); return 0; }
         if(!strcmp(argv[j],"--help")) { help(); free(a); return 0; }
         if(!strcmp(argv[j],"--no-config")) load_config=0;
         if(!strcmp(argv[j],"--no-wizard")) wizard=0;
@@ -1867,15 +2218,10 @@ static int atv_main(int argc, char **argv)
     }
     Settings settings={.c=a->c,.stack_frames=25};
     if(load_config && !settings_load(&settings,config_path,required_config)) { free(a); return 2; }
-    a->c=settings.c;
-    int rolling=settings.rolling, explicit_nicam=0;
-    a->stacking=settings.stacking; a->stack_paused=settings.paused;
-    a->light_stacking=settings.light_stacking;
-    a->vertical_shift=settings.vertical_shift;
-    SDL_AtomicSet(&a->audio_source,settings.audio_source);
-    SDL_AtomicSet(&a->audio_muted,settings.audio_muted);
-    SDL_AtomicSet(&a->audio_swap,settings.audio_swap);
-    stack_reset(&a->stack, (unsigned)settings.stack_frames);
+    snprintf(settings.profile_base,sizeof(settings.profile_base),"%s",config_path);
+    settings.load_profiles=load_config;
+    apply_settings(a,&settings);
+    int rolling=settings.rolling, explicit_nicam=0, explicit_invert=0;
     for (int j = 1; j < argc; ++j) {
         const char *o = argv[j];
         if (!strcmp(o,"--no-config") || !strcmp(o,"--no-wizard") || !strcmp(o,"--wizard") || !strcmp(o,"--terminal-wizard")) continue;
@@ -1894,10 +2240,16 @@ static int atv_main(int argc, char **argv)
             !strcmp(o,"--experimental-echo-sync")) { a->c.experimental_sync=1; continue; }
         if (!strcmp(o,"--free-sync")) { a->c.free_sync=1; continue; }
         if (!strcmp(o,"--nicam")) { SDL_AtomicSet(&a->audio_source,1); explicit_nicam=1; continue; }
-        if (!strcmp(o,"--invert")) { a->c.invert=1; continue; }
+        if (!strcmp(o,"--invert")) { a->c.invert=1; explicit_invert=1; continue; }
         if (++j >= argc) { fprintf(stderr,"Missing value for %s\n",o); free(a); return 2; }
         const char *v = argv[j];
-        if (!strcmp(o,"--args")) a->c.args=v;
+        if (!strcmp(o,"--iq-dc-block")) {
+            if(!strcmp(v,"auto")) a->c.iq_dc_block=0;
+            else if(!strcmp(v,"on")) a->c.iq_dc_block=1;
+            else if(!strcmp(v,"off")) a->c.iq_dc_block=2;
+            else { fprintf(stderr,"--iq-dc-block requires auto, on or off\n"); free(a); return 2; }
+        }
+        else if (!strcmp(o,"--args")) a->c.args=v;
         else if (!strcmp(o,"--status-bind")) a->c.status_bind=v;
         else if (!strcmp(o,"--status-port")) {
             double port=number(v);
@@ -1930,6 +2282,10 @@ static int atv_main(int argc, char **argv)
             if(strcmp(v,"0") && strcmp(v,"1")) { fprintf(stderr,"--fm-mode requires 0 or 1\n"); free(a); return 2; }
             a->c.fm_mode=atoi(v);
         }
+        else if (!strcmp(o,"--hackrf-amp")) {
+            if(strcmp(v,"0") && strcmp(v,"1")) { fprintf(stderr,"--hackrf-amp requires 0 or 1\n"); free(a); return 2; }
+            a->c.hackrf_amp=atoi(v);
+        }
         else if (!strcmp(o,"--hackrf-vga")) a->c.hackrf_vga=number(v);
         else if (!strcmp(o,"--gain")) a->c.gain=number(v);
         else if (!strcmp(o,"--video-deemphasis")) {
@@ -1950,12 +2306,23 @@ static int atv_main(int argc, char **argv)
         } else { fprintf(stderr,"Unknown option: %s\n",o); free(a); return 2; }
     }
     if(!a->c.rx_block) a->c.rx_block=settings_default_rx_block(a->c.mode);
+configure_receiver:
     settings.c=a->c;
+    settings.stacking=a->stacking; settings.stack_frames=(int)a->stack.target;
+    settings.light_stacking=a->light_stacking; settings.paused=a->stack_paused;
+    settings.rolling=rolling; settings.vertical_shift=a->vertical_shift;
+    settings.audio_source=SDL_AtomicGet(&a->audio_source);
+    settings.audio_muted=SDL_AtomicGet(&a->audio_muted);
+    settings.audio_swap=SDL_AtomicGet(&a->audio_swap);
     if(wizard) {
         int setup=wizard==2?settings_wizard(&settings,stdin,stdout):graphical_wizard(&settings);
         if(setup<=0) { free(a); return setup<0?1:0; }
     }
-    a->c=settings.c;
+    apply_settings(a,&settings);
+    /* Polarity always starts normal unless explicitly requested on the CLI,
+     * including when a saved configuration or SDR profile has invert enabled. */
+    a->c.invert=explicit_invert;
+    rolling=settings.rolling;
     if(!strcmp(a->c.mode,"file") && (!a->c.file || !*a->c.file)) { fprintf(stderr,"File source requires a path\n"); free(a); return 2; }
     /* CLI uses the frequency ahead of the converter. Keep all internal
      * tuning state in SDR Hz; the UI adds the LO back after hardware tuning. */
@@ -2018,12 +2385,16 @@ static int atv_main(int argc, char **argv)
     ScreenshotExposure *exposure=NULL;
     a->stack_ready=SDL_CreateCond();
     StatusServer *status_server=NULL;
-    int result = 1;
+    DiagnosticLog *diagnosis=NULL;
+    int result = 1, reopen_setup=0;
     if (!a->mutex || !a->stack_ready || !window || !r || !texture || !view || !ui_text_init(r)) goto cleanup;
+    diagnosis=diagnostic_log_create(diagnostic_snapshot,a);
     SDL_RenderSetLogicalSize(r,UI_WIDTH,UI_HEIGHT);
     a->afc_anchor=a->c.frequency;
     a->requested_hz=a->actual_hz=a->c.frequency; a->requested_gain=a->actual_gain=a->c.gain; a->invert=a->c.invert;
     a->fm_mode=a->c.fm_mode;
+    a->video_deemphasis=a->c.video_deemphasis;
+    a->experimental_sync=a->c.experimental_sync;
     a->if_bandwidth=a->c.if_bandwidth; a->line_hz=a->c.line_hz; a->free_sync=a->c.free_sync;
     for (int k=0;k<FFT_SIZE;++k) a->spectrum[k]=-120;
     a->recorder=iq_recorder_create();
@@ -2038,11 +2409,12 @@ static int atv_main(int argc, char **argv)
     thread = SDL_CreateThread(worker,"RX-DSP",a);
     if (!thread) goto cleanup;
     uint32_t start = SDL_GetTicks();
-    int screenshot_requested=0, save_result=0;
-    uint32_t save_notice=0;
+    int screenshot_requested=0, save_result=0, diagnostic_screenshot_requested=0;
+    uint32_t save_notice=0, screenshot_notice=0, if_notice=0;
     uint32_t record_notice=0;
     const char *record_warning=NULL;
     FrequencyInput frequency_input={0};
+    StationInput station_input={0};
     InfoScreen info_screen={0};
     SpectrumScale spectrum_scale={0};
     uint32_t info_opened=0;
@@ -2057,16 +2429,11 @@ static int atv_main(int argc, char **argv)
             if(e.type==SDL_MOUSEBUTTONDOWN || e.type==SDL_MOUSEBUTTONUP)
                 e.button.x-=UI_SIDE_WIDTH;
             if(e.type==SDL_MOUSEMOTION) e.motion.x-=UI_SIDE_WIDTH;
-            if(!frequency_input.active && !info_screen.active) {
-                SDL_Keycode side_key=side_control_key(&e);
-                if(side_key!=SDLK_UNKNOWN) {
-                    SDL_zero(e);
-                    e.type=SDL_KEYDOWN;
-                    e.key.keysym.sym=side_key;
-                }
+            if(!frequency_input.active && !station_input.active && !info_screen.active) {
+                side_control_event(&e);
             }
             int info_was_active=info_screen.active;
-            if(!frequency_input.active && info_screen_event(&info_screen,&e)) {
+            if(!frequency_input.active && !station_input.active && info_screen_event(&info_screen,&e)) {
                 if(info_screen.active!=info_was_active) {
                     if(info_screen.active) info_opened=SDL_GetTicks();
                     else start+=SDL_GetTicks()-info_opened;
@@ -2077,7 +2444,23 @@ static int atv_main(int argc, char **argv)
                 }
                 continue;
             }
+            if(!frequency_input.active && station_input_event(&station_input,a,&e)) continue;
             if(frequency_input_event(&frequency_input,a,&e)) continue;
+            if(e.type==SDL_KEYDOWN && e.key.keysym.sym==SDLK_x && !e.key.repeat) {
+                reopen_setup=1; SDL_AtomicSet(&a->stop,1); break;
+            }
+            if(e.type==SDL_KEYDOWN && e.key.keysym.sym==SDLK_F10 && !e.key.repeat) {
+                if(e.key.keysym.mod & KMOD_SHIFT) {
+                    if(diagnostic_log_state(diagnosis)==DIAG_SAVED) SDL_SetClipboardText(diagnostic_log_path(diagnosis));
+                } else if(!diagnostic_screenshot_requested) {
+                    int was_recording=diagnostic_log_state(diagnosis)==DIAG_RECORDING;
+                    if(!was_recording) a->diagnosis_previous_tick=0;
+                    diagnostic_log_toggle(diagnosis);
+                    if(!was_recording && diagnostic_log_state(diagnosis)==DIAG_RECORDING)
+                        diagnostic_screenshot_requested=1;
+                }
+                continue;
+            }
             double delta=0, gain_delta=0;
             double step = SDL_GetModState() & KMOD_CTRL ? 1e4 : SDL_GetModState() & KMOD_SHIFT ? 1e6 : 1e5;
             if (e.type == SDL_QUIT || (e.type == SDL_KEYDOWN &&
@@ -2105,8 +2488,10 @@ static int atv_main(int argc, char **argv)
             if(e.type==SDL_KEYDOWN) {
                 SDL_Keycode key=e.key.keysym.sym;
                 if(key==SDLK_n && !e.key.repeat && sound_enabled(a->c.rate,a->if_bandwidth)) {
-                    if(e.key.keysym.mod & KMOD_SHIFT)
-                        SDL_AtomicSet(&a->audio_swap,!SDL_AtomicGet(&a->audio_swap));
+                    if(e.key.keysym.mod & KMOD_SHIFT) {
+                        if(SDL_AtomicGet(&a->audio_source)>=2 && stereo_sound_enabled(a->c.rate,a->if_bandwidth))
+                            SDL_AtomicSet(&a->audio_swap,!SDL_AtomicGet(&a->audio_swap));
+                    }
                     else {
                         int next=(SDL_AtomicGet(&a->audio_source)+1)%4;
                         if(next>=2 && !stereo_sound_enabled(a->c.rate,a->if_bandwidth)) next=0;
@@ -2116,9 +2501,13 @@ static int atv_main(int argc, char **argv)
                 }
                 if(key==SDLK_a && !e.key.repeat) SDL_AtomicSet(&a->audio_muted,!SDL_AtomicGet(&a->audio_muted));
                 if(key==SDLK_d && !e.key.repeat) { a->fm_mode^=1; a->command|=2; }
+                if(key==SDLK_e && !e.key.repeat) { a->video_deemphasis^=1; a->command|=2; }
+                if(key==SDLK_g && !e.key.repeat) { a->experimental_sync^=1; a->command|=2; }
                 if(key==SDLK_f) { a->free_sync=!a->free_sync; a->command|=2; }
                 if(key==SDLK_LEFTBRACKET || key==SDLK_RIGHTBRACKET) {
+                    double previous_if=a->if_bandwidth;
                     a->if_bandwidth=fmin(a->c.rate,fmax(250000,a->if_bandwidth+(key==SDLK_LEFTBRACKET?-1e6:1e6))); a->command|=2;
+                    if(a->if_bandwidth!=previous_if) if_notice=SDL_GetTicks();
                 }
                 if(key==SDLK_COMMA || key==SDLK_PERIOD) {
                     a->line_hz=fmin(16250,fmax(15000,a->line_hz+(key==SDLK_COMMA?-.1:.1))); a->command|=2;
@@ -2139,6 +2528,8 @@ static int atv_main(int argc, char **argv)
                         !a->recorder?"Cannot start the IQ recorder worker":NULL;
                     if(!record_warning) {
                         IQRecordSettings recording={.c=a->c,.audio_source=SDL_AtomicGet(&a->audio_source),.vertical_shift=a->vertical_shift};
+                        recording.c.video_deemphasis=a->video_deemphasis;
+                        recording.c.experimental_sync=a->experimental_sync;
                         recording.c.frequency=a->actual_hz; recording.c.gain=a->actual_gain;
                         recording.c.if_bandwidth=a->if_bandwidth; recording.c.line_hz=a->line_hz;
                         recording.c.fm_mode=a->fm_mode; recording.c.invert=a->invert; recording.c.free_sync=a->free_sync;
@@ -2158,18 +2549,11 @@ static int atv_main(int argc, char **argv)
                     if(e.key.keysym.mod & KMOD_SHIFT) action=5;
                     else {
                         screenshot_requested=(e.key.keysym.mod & KMOD_CTRL)?2:1;
+                        screenshot_notice=SDL_GetTicks();
                         if(exposure) memset(exposure,0,sizeof(*exposure));
                     }
                 }
                 if (key == SDLK_m) action = 6;
-            }
-            if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT &&
-                e.button.y >= 830 && e.button.y < 860) {
-                int x = e.button.x;
-                if (x >= 170 && x < 210) action = 2;
-                if (x >= 220 && x < 260) action = 3;
-                if (x >= 270 && x < 370) action = 4;
-                if (x >= 380 && x < 500) action = 5;
             }
             stack_action(a,action);
             int save=e.type==SDL_KEYDOWN && e.key.keysym.sym==SDLK_w && !e.key.repeat;
@@ -2184,6 +2568,7 @@ static int atv_main(int argc, char **argv)
             }
         }
         status_server_poll(status_server,status_json,a);
+        diagnostic_log_poll(diagnosis);
         SDL_Rect full_viewport;
         SDL_RenderGetViewport(r,&full_viewport);
         SDL_SetRenderDrawColor(r,14,19,27,255); SDL_RenderClear(r);
@@ -2223,10 +2608,25 @@ static int atv_main(int argc, char **argv)
         }
         SDL_SetRenderDrawColor(r,220,230,240,255);
         char buf[256];
+        time_t timestamp=time(NULL);
+        struct tm utc;
+        char utc_text[32];
+        if(gmtime_r(&timestamp,&utc) && strftime(utc_text,sizeof(utc_text),"%Y-%m-%d %H:%M:%S UTC",&utc)) {
+            snprintf(buf,sizeof(buf),"%s%s%s%s%s",utc_text,
+                *a->my_call?"  ":"",a->my_call,*a->my_locator?"  ":"",a->my_locator);
+            /* Scale 2 uses eight-pixel cells; both video layouts centre at x=480. */
+            int caption_x=(960-(int)strlen(buf)*8)/2;
+            text(r,caption_x,v->stacking && !v->scope_enabled?515:612,buf,2);
+        }
         snprintf(buf,sizeof(buf),"%.3f MHZ",(v->actual_hz+v->c.lo)/1e6);
         text(r,20,8,buf,6);
         int settings_x=20+(int)strlen(buf)*24+24;
-        snprintf(buf,sizeof(buf),"%s %.0f DB   %.2f MS/S   BW %.2f MHZ",!strcmp(v->c.mode,"hackrf")?"LNA":"GAIN",v->actual_gain,v->c.rate/1e6,v->c.bandwidth/1e6);
+        const char *sdr_type=!strcmp(v->c.mode,"b210")?"B210":
+            !strcmp(v->c.mode,"hackrf")?"HackRF":!strcmp(v->c.mode,"pluto")?"PlutoSDR":
+            !strcmp(v->c.mode,"sdrplay")?"SDRplay RSP1B":!strcmp(v->c.mode,"demo")?"Demo":
+            !strcmp(v->c.mode,"file")?"File":v->c.mode;
+        snprintf(buf,sizeof(buf),"SDR: %s  %s: %.0f dB  Samplerate: %.2f MS/s  BW: %.2f MHz",
+            sdr_type,!strcmp(v->c.mode,"hackrf")?"LNA":"Gain",v->actual_gain,v->c.rate/1e6,v->c.bandwidth/1e6);
         text(r,settings_x,15,buf,2);
         text(r,settings_x,30,"T FREQUENCY MHZ",2);
         /* Keep the former status row empty without moving the video up. */
@@ -2258,17 +2658,9 @@ static int atv_main(int argc, char **argv)
             text(r,60+k*365,780,buf,2);
         }
 
-        const SDL_Rect buttons[] = {{170,830,40,30},{220,830,40,30},{270,830,100,30},{380,830,120,30}};
-        int light_controls=v->c.rate>10e6 && !v->stacking;
-        const char *labels[] = {light_controls?"N/A":"-",light_controls?"N/A":"+",light_controls?"N/A":"RESET R",
-            light_controls?"N/A":v->stack_paused?"RESUME":"PAUSE"};
-        for (int k=0;k<4;++k) {
-            SDL_SetRenderDrawColor(r,light_controls?30:45,light_controls?40:65,light_controls?50:80,255); SDL_RenderFillRect(r,&buttons[k]);
-            SDL_SetRenderDrawColor(r,220,230,240,255);
-            text(r,buttons[k].x+8,840,labels[k],2);
-        }
         if (v->stacking) {
-            if(v->stack_synced) snprintf(buf,sizeof(buf),"SYNC ALIGN  H AND V CONFIRMED  SKIP %llu",(unsigned long long)v->stack_skipped);
+            if(v->stack.rolling && v->c.rate<=10e6) snprintf(buf,sizeof(buf),"LIVE ROLLING RGB  SKIP %llu",(unsigned long long)v->stack_skipped);
+            else if(v->stack_synced) snprintf(buf,sizeof(buf),"SYNC ALIGN  H AND V CONFIRMED  SKIP %llu",(unsigned long long)v->stack_skipped);
             else snprintf(buf,sizeof(buf),"IMAGE ALIGN  MATCH %.2f  X %.1f  Y %.1f  SKEW %.1f  SKIP %llu",
                 v->stack.confidence,v->stack.dx,v->stack.dy,v->stack.shear,(unsigned long long)v->stack_skipped);
             text(r,20,866,buf,2);
@@ -2292,13 +2684,40 @@ static int atv_main(int argc, char **argv)
             snprintf(buf,sizeof(buf),"FM %s | %s",SDL_AtomicGet(&a->audio_locked)?"LOCK":"SEEK",
                 SDL_AtomicGet(&a->nicam_detect)?"NICAM DETECT | N SOURCE":"N NICAM | A MUTE");
         text(r,550,803,buf,2);
-        if(clipping_active(&v->clipping,SDL_GetTicks())) {
+        uint32_t clip_now=SDL_GetTicks();
+        int repeated_clipping=clipping_repeated(&v->clipping,clip_now);
+        if(clipping_active(&v->clipping,clip_now) &&
+           (repeated_clipping || clip_now-v->clipping.last_clip_tick<500)) {
             SDL_Rect bar={120,65,720,26};
-            SDL_SetRenderDrawColor(r,200,0,0,255); SDL_RenderFillRect(r,&bar);
+            SDL_SetRenderDrawColor(r,repeated_clipping?200:150,repeated_clipping?0:95,0,255); SDL_RenderFillRect(r,&bar);
             SDL_SetRenderDrawColor(r,255,255,255,255);
-            snprintf(buf,sizeof(buf),"CLIPPING  %llu SAMPLES - LOWER GAIN",
+            snprintf(buf,sizeof(buf),"%s  %llu TOTAL SAMPLES",
+                repeated_clipping?"REPEATED CLIPPING - LOWER GAIN":"IQ PEAK",
                 (unsigned long long)v->clipping.clipped_samples);
             text(r,130,72,buf,2);
+        }
+        if(station_input.active) {
+            SDL_Rect panel={40,250,880,270};
+            SDL_SetRenderDrawColor(r,24,34,46,255); SDL_RenderFillRect(r,&panel);
+            SDL_SetRenderDrawColor(r,100,180,220,255); SDL_RenderDrawRect(r,&panel);
+            SDL_SetRenderDrawColor(r,235,240,245,255);
+            text(r,60,267,"MY STATION",3);
+            for(int i=0;i<2;++i) {
+                int y=305+70*i;
+                SDL_Rect field={60,y,840,40};
+                SDL_SetRenderDrawColor(r,station_input.field==i?40:24,station_input.field==i?65:34,station_input.field==i?85:46,255);
+                SDL_RenderFillRect(r,&field);
+                SDL_SetRenderDrawColor(r,235,240,245,255);
+                snprintf(buf,sizeof(buf),"%s: %s%s",i?"my_locator":"my_call",
+                    i?station_input.my_locator:station_input.my_call,station_input.field==i?"_":"");
+                text(r,70,y+12,buf,2);
+            }
+            text(r,60,437,"TAB NEXT FIELD   ENTER NEXT / APPLY   ESC CANCEL",2);
+            text(r,60,460,"CTRL+A CLEAR FIELD   W SAVES SETTINGS AFTER APPLY",2);
+            if(station_input.error) {
+                SDL_SetRenderDrawColor(r,255,170,110,255);
+                text(r,60,490,station_input.error,2);
+            }
         }
         if(frequency_input.active) {
             SDL_Rect panel={40,250,880,190};
@@ -2319,7 +2738,14 @@ static int atv_main(int argc, char **argv)
         }
         draw_iq_recording(r,&v->recording,record_warning && SDL_GetTicks()-record_notice<8000?record_warning:NULL);
         SDL_RenderSetViewport(r,&full_viewport);
-        draw_side_panels(r,v,save_notice,save_result);
+        draw_side_panels(r,v,save_notice,save_result,screenshot_notice,if_notice);
+        draw_diagnosis(r,diagnosis);
+        if(diagnostic_screenshot_requested) {
+            char path[160];
+            int saved=save_window_png(r,v->actual_hz+v->c.lo,path,sizeof(path))==0;
+            diagnostic_log_screenshot(diagnosis,path,saved);
+            diagnostic_screenshot_requested=0;
+        }
         if(screenshot_ready) {
             char path[160];
             if(photo) fprintf(stderr,"Screenshot exposure: %u distinct displayed fields over %u ms\n",
@@ -2353,6 +2779,7 @@ static int atv_main(int argc, char **argv)
     fprintf(stderr,"Stack frames skipped: %llu\n",(unsigned long long)a->stack_skipped);
     fprintf(stderr,"Displayed fields: %u; stream discontinuities: %u\n",a->frames,a->overflows);
 cleanup:
+    diagnostic_log_destroy(diagnosis);
     status_server_close(status_server);
     if (result && !SDL_AtomicGet(&a->failed)) fprintf(stderr,"UI: %s\n",SDL_GetError());
     if(thread || stack_thread) {
@@ -2361,6 +2788,7 @@ cleanup:
         if(thread) SDL_WaitThread(thread,NULL);
         if(stack_thread) SDL_WaitThread(stack_thread,NULL);
     }
+    if(reopen_setup && !result) current_settings(a,&settings);
     if (texture) SDL_DestroyTexture(texture);
     iq_recorder_destroy(a->recorder);
     free(view);
@@ -2370,7 +2798,17 @@ cleanup:
     if(a->stack_ready) SDL_DestroyCond(a->stack_ready);
     if (a->mutex) SDL_DestroyMutex(a->mutex);
     if(a->audio_device) SDL_CloseAudioDevice(a->audio_device);
-    source_close(a->source); stack_destroy(&a->stack); free(a); return result;
+    source_close(a->source); stack_destroy(&a->stack); free(a);
+    if(reopen_setup && !result) {
+        a=calloc(1,sizeof(*a));
+        if(!a) return 1;
+        a->if_power_dbfs=NAN;
+        apply_settings(a,&settings);
+        rolling=settings.rolling;
+        wizard=1; settings.reopen_menu=1;
+        goto configure_receiver;
+    }
+    return result;
 }
 
 int main(int argc, char **argv)

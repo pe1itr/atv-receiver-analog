@@ -166,7 +166,7 @@ For live weak-signal reception with stacking:
 
 | SDR | Application sample-rate range for live stacking |
 | --- | --- |
-| PlutoSDR | 5–10 MS/s; 5 and 6 MS/s have been used with video sync |
+| PlutoSDR | PlutoSky and original ADALM-PLUTO: use 5–6 MS/s over USB in the tested setup |
 | HackRF and B210 | 8–10 MS/s |
 | SDRplay RSP1B | 8 to strictly below 10 MS/s; not tested on real hardware |
 
@@ -182,10 +182,19 @@ reference and manual receive gain. Without a URI it selects one USB AD9361
 receiver. With multiple devices, specify `--pluto-uri`; `iio_info -s` lists URIs.
 USB URIs may change after reconnecting.
 
+Practical sample-rate guidance for **PlutoSky and the original ADALM-PLUTO**:
+use **6 MS/s or lower over USB** (the application minimum is 5 MS/s).
+The original ADALM-PLUTO processed approximately 6.98 MS/s when configured for
+10 MS/s, and 5.97 MS/s when configured for 6 MS/s in this setup.
+For **PlutoSky over native 1 Gbit/s Ethernet**, use **14 MS/s**; this Ethernet
+recommendation was measured with PlutoSky only. These are operating
+recommendations, not theoretical interface limits. An IP connection carried over
+USB still has the USB limit.
+
 ```sh
 ./build/atv-rx --no-config --no-wizard --pluto \
-  --frequency 1252000000 --rate 10000000 \
-  --bandwidth 8000000 --if-bandwidth 6000000 --gain 30
+  --frequency 1252000000 --rate 6000000 \
+  --bandwidth 5000000 --if-bandwidth 4000000 --gain 30
 
 # Network connection:
 ./build/atv-rx --no-config --no-wizard --pluto --pluto-uri ip:192.168.2.1 \
@@ -246,13 +255,23 @@ overflows while processing fewer samples per second than requested.
 ```
 
 The gain control adjusts **RX LNA only**, from 0 to 40 dB in 8 dB steps.
-RX VGA defaults to a fixed 28 dB; the RF amplifier remains enabled
-(nominally 14 dB). Set VGA separately with `--hackrf-vga`, from 0 to 62 dB
+RX VGA defaults to a fixed 12 dB. The RF preamp (nominally 14 dB) is
+independently switchable in setup or with `--hackrf-amp 0|1` (default on).
+Set VGA separately in setup or with `--hackrf-vga`, from 0 to 62 dB
 in 2 dB steps. The interface labels the adjustable gain as `LNA`.
 
 Older configurations used total gain; those values are not directly
 comparable. Values are rounded/clamped to the supported LNA settings.
 Check clipping and reception quality after changing gain.
+
+HackRF automatically uses a narrow 10 Hz IQ DC blocker before FM in both
+the video and sync paths. This prevents the receiver's DC spike from
+suppressing visible noise and weak video. Raw IQ recordings, raw clipping
+counts remain before DC rejection. Both wideband and IF level measurements
+exclude the constant I/Q component, independently of the FM DC blocker.
+Use `--iq-dc-block auto|on|off` to override this behavior; `on` also enables
+the correction when replaying a raw HackRF recording. New F9 metadata
+includes the correction state and the corresponding playback option.
 
 ### B210 and the OpenSourceSDRLab Kintex-7 clone
 
@@ -301,11 +320,40 @@ with multiple receivers. On Windows the module must match x64, SoapySDR ABI 0.8
 and the package's MinGW build; place it in `modules` with its dependencies
 available. The standard ZIP does not bundle this module.
 
+## Controls layout
+
+The 1500 x 880 receiver window has six framed control groups stacked vertically
+on the right: Tuning, Video, Stacking, Recording, Audio and Settings. Each group
+has at most three buttons per row; its height follows the number of buttons.
+The white top border is interrupted by the group title. Video IF, AFC and FM
+mode are together in Tuning. Click the left/right half of Video IF to decrease/
+increase bandwidth by 1 MHz; the bracket keys still work. Stack size, reset
+and pause controls are all in Stacking. The combined FRAMES button displays
+`- count +`: click its left half to decrease the count or its right half to
+increase it. Existing keyboard shortcuts remain
+available. The window can be resized; image proportions and button hit areas
+follow the logical layout.
+
 ## Configuration
 
 At startup, **W + Enter** enters the wizard; **Enter** uses the current settings.
 The hardware choices are 1 B210, 2 HackRF, 3 PlutoSDR and 4 SDRplay RSP1B.
 `Installed` indicates available driver support, not a connected or verified SDR.
+After choosing an SDR, all its settings and current values appear together.
+Click a row or enter its number to edit it, then return to the overview.
+Press Enter to start reception. HackRF preamp selection toggles it immediately.
+Press **H + Enter** in setup to choose another SDR. From the main screen,
+press **X** or click **X SETUP** to return to the current SDR settings;
+reception stops while configuring and restarts with the selected settings.
+**G** or **G EXP SYNC** on the main screen toggles experimental echo-resistant
+line sync (default off). **W** saves this as an application setting; switching
+SDR profiles preserves its current state.
+Press **W** in the overview or during reception to save both
+the startup configuration and a separate profile for the selected SDR.
+Profiles use the configuration filename plus `.b210`, `.hackrf`, `.pluto`
+or `.sdrplay`; choosing a different SDR restores its saved profile, including
+sample rate, video IF, gain and device selection. `--no-config` skips loading
+profiles as well.
 
 Frequencies and bandwidths in the wizard and command line are in Hz. The wizard
 selects analog bandwidth as sample rate minus 1 MHz below 8 MS/s, or minus
@@ -323,7 +371,8 @@ Press **W** during reception to save the complete current configuration:
 - Windows: `%APPDATA%\PE1ITR\ATV Receiver\atv-rx.conf`
 
 Command-line options override saved settings; subsequent wizard changes take
-precedence. The wizard does not save automatically. AFC starts disabled.
+precedence. The wizard saves only when requested with W (terminal: W + Enter).
+AFC starts disabled.
 
 ```sh
 ./build/atv-rx --no-wizard
@@ -363,6 +412,8 @@ does not compensate for spectral inversion introduced by a converter.
 | Click spectrum | Tune the selected frequency to the center |
 | `T` | Enter frequency directly in MHz; Enter confirms, Esc cancels |
 | `W` | Save current settings |
+| `I` / I INVERSE | Toggle video polarity; starts OFF even if saved ON (unless `--invert` is passed) |
+| `F7` | Edit `my_call` and `my_locator`; Enter advances/applies, Tab switches fields, Esc cancels |
 | `!` / Shift+1 | Show controls and version; reception pauses until dismissed |
 | Up/down arrows | Adjust gain; HackRF uses 8 dB LNA steps |
 | `[` / `]` | Decrease/increase digital video IF by 1 MHz |
@@ -373,6 +424,8 @@ does not compensate for spectral inversion introduced by a converter.
 | `I` | Invert FM video polarity |
 | `D` | Switch FM0/FM1 demodulation |
 | `O` | Switch between the TV picture and the video oscilloscope |
+| `F10` | Record a 30-second diagnostic text file; press again to stop early |
+| `Shift+F10` | Copy the saved diagnostic file path |
 | `F9` | Start/stop a raw IQ recording; saves automatically after 3 seconds |
 | `A` | Mute/unmute audio |
 | `N` | Cycle FM mono, NICAM and the two FM stereo pairs |
@@ -392,6 +445,12 @@ requiring sync lock, keeps colour, and can soften moving objects. When stacking
 is enabled, the stacked pane is saved as displayed and only the live pane is
 averaged. `Ctrl+P` captures one instant instead. `--snapshot PATH` also supports
 saving a BMP on exit.
+
+The line below the video shows the current UTC date/time followed by your call
+and Maidenhead locator, including in screenshots. Set `my_call` and `my_locator`
+with **F7**, then press **W** after applying to
+save them for the next start. Empty fields are allowed; locators accept 4, 6, 8
+or 10 characters (for example `JO22AA`).
 
 Press `O` to replace the TV picture with a video oscilloscope, and `O` again
 to return. The trace shows two line periods (about 128 microseconds), including
@@ -426,7 +485,7 @@ before selecting the strongest one, then requires consistent timing across
 three fields. This prevents an earlier dark picture feature from hiding the
 real sync pulse and producing a stationary picture at the wrong vertical position.
 
-Stacking averages accepted, aligned field pictures to reduce noise. With
+Fixed stacking averages accepted, aligned field pictures to reduce noise. With
 reliable sync, received raster timing determines alignment. Without reliable
 sync, image matching is used while the raster clock continues running.
 Incomplete or unreliable pictures are rejected. `HOLD` preserves the current
@@ -451,8 +510,13 @@ options still select the contest stack for offline IQ files and the demo.
 six-picture rolling stack (about 120 ms). The picture uses the full TV area.*
 
 - **FIXED:** accumulate the requested number of fields, then freeze at `DONE`.
-- **ROLLING:** average the latest N accepted fields, replacing the oldest one
-  with each new accepted field. Rejected fields and pauses do not advance it.
+- **ROLLING at up to 10 MS/s:** continuously average the latest N live pictures
+  in the small stack pane, keeping RGB colour. Like S above 10 MS/s, this uses
+  no image matching, parity selection or completeness gate, so it keeps moving
+  during weak reception. Moving pictures or an unstable raster can smear.
+  Pause holds the picture; resuming starts a fresh averaging window.
+- **ROLLING above 10 MS/s for offline contest stacks:** average the latest N
+  accepted, aligned fields, replacing the oldest with each accepted field.
 
 Use **R** to reset, **M** to change mode, and **Shift+P** to pause/resume.
 Changing the rolling window size starts a new stack. Live SDR contest stacking
@@ -483,6 +547,8 @@ threads and bounded queues. Buffering absorbs short scheduling delays but
 cannot recover from sustained overload or lost IQ samples.
 
 The video path defaults to linear-phase **ITU-R F.405-1 PAL de-emphasis**.
+Press **E** or click **E DE-EMPH** on the main screen to switch it on/off.
+The selection is saved with **W**.
 Use `--video-deemphasis off` for flat signals without transmitter pre-emphasis,
 including the offline generator's test signals. `--video-deemphasis pal`
 selects the default explicitly. Audio is taken before video de-emphasis.
@@ -528,6 +594,48 @@ file. A discontinuity or tuning/gain change restarts collection. Limits are
 uses about 240 MB. Save the reception settings separately: no metadata is
 embedded in the IQ file.
 
+The main screen always shows the version and short Git commit hash at the top
+right, including in screenshots. A `-dirty` suffix after the hash marks tracked changes
+that were not committed when the receiver was built. The diagnostic text
+retains both the commit hash and UTC build timestamp.
+
+## Diagnostic text recording
+
+Press **F10** (or the F10 DIAG button) while the problem is visible. The receiver
+immediately saves a screenshot PNG and collects scalar snapshots once per second
+for **30 seconds**, then saves one
+`atv-diagnose-UTC-NNN.txt` file in the current working directory. F10 stops early;
+closing the receiver or returning to setup saves a partial recording. Recording
+does not change settings or require the HTTP status server. Diagnostic text writes run
+on a separate thread. The screen reports recording, saving, the saved filename or
+a save error. **Shift+F10** copies the full saved path for locating the file.
+Send the text file **and the initial screenshot PNG** to Rob for analysis. The
+text file names the screenshot and contains build/platform information,
+settings, tuning and AFC state, sync, quality validity, clipping, queue and loss
+counters, process CPU usage, total system CPU busy percentage, logical CPU count,
+and raw JSON snapshots. CPU values are averages between snapshots; the first
+snapshot has no interval measurement. Process CPU is shown as core equivalents
+and as a percentage of one CPU and of all reported logical CPUs. One fully used
+logical CPU is 1.0 core / 100% of one CPU. System CPU busy also includes other
+programs (Linux idle and I/O-wait time are excluded).
+Sync diagnostics explain whether the lamp is off because H sync, V sync, both,
+or a fresh video frame is missing (150 ms timeout). Cumulative H, V and combined
+lock-loss counters are updated at decoder frame callbacks, retaining observed
+losses even if sync recovers between snapshots. They start at zero for each
+receiver session; initial acquisition is not a loss. Decoder resets and setting
+changes can also cause losses. Confirmation ages are measured in decoded fields
+for H and sample-clock milliseconds for V, at the last frame callback; `null`
+means no confirmation since decoder initialization. These ages stop advancing
+when frames stop; use the video age and indicator reason for frame freshness.
+Completed frame gaps of at least 150 ms are counted, and the maximum completed
+frame gap is retained separately. Gaps can include pauses or setting changes and do not establish SDR
+sample loss. An ongoing gap is visible through `video.age_ms` before it is counted
+on the next frame. Other brief events between snapshots or frame callbacks may
+be missed. Consumed-sample throughput is not a
+measurement of SDR transport continuity. No IQ or decoded audio is included.
+The screenshot is a separate PNG. Saved files remain on disk until the user
+removes them.
+
 ## Read-only status interface
 
 The optional HTTP status interface is disabled by default. Enable it with:
@@ -554,9 +662,12 @@ stacking, receive queues and quality diagnostics.
 
 ### Interpreting measurements
 
-- `video.if_signal_dbfs` is total IQ power **after the video IF filter and
-  before FM demodulation**: signal plus noise in dBFS, not dBm or C/N.
-  `video.signal_dbfs` is the wideband level before that filter.
+- `video.if_signal_dbfs` is IQ power **after the video IF filter and
+  before FM demodulation, excluding DC**: signal plus noise in dBFS, not dBm
+  or C/N. `video.signal_dbfs` is the wideband level before that filter, also
+  excluding DC. Both measurements remove the measured block's mean I and Q;
+  they do not depend on whether the FM path's DC blocker is enabled.
+  Earlier builds included DC, so their levels are not directly comparable.
 - `video_quality.video_snr_db` is an unweighted diagnostic PAL estimate after
   FM and the selected filtering/de-emphasis. Use it only when `valid` is true;
   otherwise inspect `reason`. A missing value is not zero dB.
@@ -577,6 +688,11 @@ Bandwidth, gain, detector mode and de-emphasis changes alter measurement
 conditions. A single snapshot cannot establish a cause or an optimal setting.
 Digital clipping diagnostics indicate sample saturation; they do not detect
 all possible analog overload earlier in the receive chain.
+An isolated digital rail hit displays a brief amber `IQ PEAK` notice.
+Rail hits in three consecutive 100 ms windows display a red
+`REPEATED CLIPPING` notice with advice to lower gain. Both kinds of hit
+remain included in the cumulative clipping counter; recurrence alone does
+not establish the source of the peaks.
 
 ## Building the Windows package
 

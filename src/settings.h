@@ -8,7 +8,10 @@ typedef struct {
     int stacking, stack_frames, rolling, paused, vertical_shift;
     int light_stacking;
     int audio_source, audio_muted, audio_swap;
+    char my_call[17], my_locator[11];
     char strings[9][1024];
+    char profile_base[4096]; /* Main configuration path, not serialized. */
+    int load_profiles, reopen_menu;
 } Settings;
 /* Missing optional files are allowed. Malformed files fail with a diagnostic. */
 size_t settings_default_rx_block(const char *mode);
@@ -21,7 +24,7 @@ int settings_load(Settings *s, const char *path, int required);
 int settings_save(const Settings *s, const char *path);
 typedef struct {
     const char *title, *current, *details, *error;
-    enum { SETTINGS_VALUE, SETTINGS_WELCOME, SETTINGS_HARDWARE } kind;
+    enum { SETTINGS_VALUE, SETTINGS_WELCOME, SETTINGS_HARDWARE, SETTINGS_MENU } kind;
 } SettingsPrompt;
 /* Return 1 with a submitted line, or 0 to cancel startup. */
 typedef int (*SettingsPromptFn)(void *, const SettingsPrompt *, char *, size_t);

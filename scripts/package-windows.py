@@ -68,6 +68,7 @@ info+='FFTW 3.3.10 single precision with SSE2 (x64 baseline), built from source.
 info+='Upstream source URLs and checksums are recorded in the project repository: scripts/build-windows.sh and scripts/windows/deps.sha256\n'
 info+='FreeType is used under the FreeType License; see licenses/mingw64-freetype/FTL.TXT.\n\n'+versions
 (build/'BUILD-INFO.txt').write_text(info)
+(out/'BUILD-INFO.txt').write_text(info)
 # Debug symbols are useful locally, but are not needed by the receiver.
 for binary in [out/'atv-rx.exe',*out.rglob('*.dll')]:
  subprocess.run(['x86_64-w64-mingw32-strip','--strip-debug',str(binary)],check=True)

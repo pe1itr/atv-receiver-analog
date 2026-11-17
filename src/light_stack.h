@@ -11,4 +11,15 @@ typedef struct {
 void light_stack_reset(LightStack *s);
 /* Exact rolling RGB average, without registration, sync gating or allocation. */
 void light_stack_add(LightStack *s,const uint32_t *pixels,uint32_t *output);
+/* Variable-window equivalent for the small live rolling pane. Initialize to
+ * zero before configuring; configuration discards the previous history. */
+typedef struct {
+    uint32_t *history;
+    uint32_t sum[WIDTH*HEIGHT][3];
+    unsigned target,count,next;
+    uint64_t accepted;
+} LiveStack;
+int live_stack_configure(LiveStack *s,unsigned target);
+void live_stack_add(LiveStack *s,const uint32_t *pixels,uint32_t *output);
+void live_stack_destroy(LiveStack *s);
 #endif

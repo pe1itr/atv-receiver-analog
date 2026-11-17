@@ -1,5 +1,6 @@
 #include "light_stack.h"
 #include <string.h>
+#include <stdlib.h>
 void light_stack_reset(LightStack *s)
 {
     s->count=s->next=0;
@@ -22,4 +23,38 @@ void light_stack_add(LightStack *s,const uint32_t *pixels,uint32_t *output)
             ((green+count/2)/count<<8)|((blue+count/2)/count);
     }
     s->next=(s->next+1)%LIGHT_STACK_FRAMES;
+}
+
+int live_stack_configure(LiveStack *s,unsigned target)
+{
+    if(!target || target>512) return 0;
+    if(s->target!=target || !s->history) {
+        uint32_t *history=malloc((size_t)target*WIDTH*HEIGHT*sizeof(*history));
+        if(!history) return 0;
+        free(s->history); s->history=history;
+    }
+    s->target=target; s->count=s->next=0; s->accepted=0;
+    return 1;
+}
+void live_stack_add(LiveStack *s,const uint32_t *pixels,uint32_t *output)
+{
+    int first=!s->count,full=s->count==s->target;
+    if(!full) ++s->count;
+    uint32_t *slot=s->history+(size_t)s->next*WIDTH*HEIGHT;
+    for(size_t j=0;j<WIDTH*HEIGHT;++j) {
+        uint32_t old=full?slot[j]:0,new=pixels[j];
+        slot[j]=new;
+        unsigned red=(first?0:s->sum[j][0])+((new>>16)&255)-((old>>16)&255);
+        unsigned green=(first?0:s->sum[j][1])+((new>>8)&255)-((old>>8)&255);
+        unsigned blue=(first?0:s->sum[j][2])+(new&255)-(old&255);
+        s->sum[j][0]=red; s->sum[j][1]=green; s->sum[j][2]=blue;
+        unsigned count=s->count;
+        output[j]=0xff000000u|((red+count/2)/count<<16)|
+            ((green+count/2)/count<<8)|((blue+count/2)/count);
+    }
+    s->next=(s->next+1)%s->target; ++s->accepted;
+}
+void live_stack_destroy(LiveStack *s)
+{
+    free(s->history); s->history=NULL; s->target=s->count=s->next=0;
 }
