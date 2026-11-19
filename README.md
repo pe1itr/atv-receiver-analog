@@ -29,6 +29,7 @@ interlaced fields into a 576-line frame.
 ### Windows
 
 Download the ZIP from [GitHub Releases](https://github.com/pe1itr/atv-receiver-analog/releases/latest).
+The project keeps the three most recently published releases on GitHub.
 The package targets Windows 10 version 1903 or later and Windows 11, x64.
 The setup and receiver windows scale to the available desktop space on smaller
 laptop screens. Press **Alt+Enter** in either window to toggle full screen.

@@ -299,3 +299,14 @@ De instellingen en het log staan in `%APPDATA%\PE1ITR\ATV Receiver\`.
 
 Bediening, ontvangstinstellingen en de bandbreedtegrenzen voor kleur en geluid
 staan in de [README](README.md).
+
+## GitHub-release publiceren
+
+Gebruik `bash scripts/publish-release.sh` met dezelfde tag, bestanden en opties
+als voor `gh release create`. Na publicatie bewaart het script de drie nieuwste
+gepubliceerde releases op publicatiedatum. Het verwijdert de oudere releases
+met hun downloads en tags. Conceptreleases tellen niet mee.
+
+Gebruik na publicatie via de website of na een onderbroken opruimactie
+`bash scripts/publish-release.sh --prune-only`. Dit vereist Bash, gh, jq en
+schrijftoegang tot de repository.
