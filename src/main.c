@@ -1682,7 +1682,18 @@ static void draw_wizard(SDL_Renderer *r,const SettingsPrompt *q,const char *inpu
     }
     SDL_SetRenderDrawColor(r,140,155,170,255);
     text(r,40,805,"BACKSPACE: DELETE CHARACTER   CTRL+A: CLEAR FIELD   CTRL+V: PASTE",2);
-    text(r,40,837,"W: SAVE SETTINGS AND THIS SDR PROFILE",2);
+    text(r,40,837,"W: SAVE SETTINGS AND THIS SDR PROFILE   ALT+ENTER: FULLSCREEN",2);
+}
+static int fullscreen_shortcut(const SDL_Event *e)
+{
+    if(e->type!=SDL_KEYDOWN || !(e->key.keysym.mod & KMOD_ALT) ||
+       (e->key.keysym.sym!=SDLK_RETURN && e->key.keysym.sym!=SDLK_KP_ENTER)) return 0;
+    SDL_Window *window=SDL_GetWindowFromID(e->key.windowID);
+    if(window && !e->key.repeat) {
+        Uint32 mode=(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN)?0:SDL_WINDOW_FULLSCREEN_DESKTOP;
+        if(SDL_SetWindowFullscreen(window,mode)) fprintf(stderr,"Fullscreen: %s\n",SDL_GetError());
+    }
+    return 1;
 }
 static int graphical_prompt(void *opaque,const SettingsPrompt *q,char *line,size_t n)
 {
@@ -1695,6 +1706,7 @@ static int graphical_prompt(void *opaque,const SettingsPrompt *q,char *line,size
     for(;;) {
         SDL_Event e;
         while(SDL_PollEvent(&e)) {
+            if(fullscreen_shortcut(&e)) continue;
             if(e.type==SDL_QUIT) { SDL_StopTextInput(); return 0; }
             if(e.type==SDL_KEYDOWN) {
                 SDL_Keycode key=e.key.keysym.sym;
@@ -1759,10 +1771,26 @@ static int init_ui(void)
     return SDL_InitSubSystem(flags & ~SDL_WasInit(flags));
 }
 
+static SDL_Window *create_ui_window(const char *title,int width,int height)
+{
+    SDL_Rect area;
+    int x=SDL_WINDOWPOS_CENTERED,y=SDL_WINDOWPOS_CENTERED;
+    if(SDL_GetDisplayUsableBounds(0,&area)==0 || SDL_GetDisplayBounds(0,&area)==0) {
+        /* Usable bounds exclude desktop panels. Leave room for window decorations. */
+        int available_w=SDL_max(1,area.w-32),available_h=SDL_max(1,area.h-64);
+        double scale=fmin(1.0,fmin((double)available_w/width,(double)available_h/height));
+        width=SDL_max(1,(int)(width*scale));
+        height=SDL_max(1,(int)(height*scale));
+        x=area.x+(area.w-width)/2;
+        y=area.y+(area.h-height)/2;
+    }
+    return SDL_CreateWindow(title,x,y,width,height,SDL_WINDOW_RESIZABLE);
+}
+
 static int graphical_wizard(Settings *settings)
 {
     if(init_ui()) { fprintf(stderr,"SDL: %s\n",SDL_GetError()); return -1; }
-    SDL_Window *window=SDL_CreateWindow("FM ATV - Startup Configuration",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,960,880,SDL_WINDOW_RESIZABLE);
+    SDL_Window *window=create_ui_window("FM ATV - Startup Configuration",960,880);
     SDL_Renderer *renderer=window?SDL_CreateRenderer(window,-1,0):NULL;
     int result=-1;
     if(renderer && ui_text_init(renderer)) {
@@ -2377,7 +2405,7 @@ configure_receiver:
         a->audio_device=open_audio_output(a->c.audio_output);
     }
     a->mutex = SDL_CreateMutex();
-    SDL_Window *window = SDL_CreateWindow("FM ATV - PAL", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, UI_WIDTH, UI_HEIGHT, SDL_WINDOW_RESIZABLE);
+    SDL_Window *window = create_ui_window("FM ATV - PAL",UI_WIDTH,UI_HEIGHT);
     SDL_Renderer *r = window ? SDL_CreateRenderer(window, -1, 0) : NULL;
     SDL_Texture *texture = r ? SDL_CreateTexture(r, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT) : NULL;
     SDL_Thread *thread = NULL, *stack_thread = NULL;
@@ -2424,6 +2452,7 @@ configure_receiver:
            (!SDL_AtomicGet(&a->done) || !strcmp(a->c.mode,"file"))) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            if(fullscreen_shortcut(&e)) continue;
             /* SDL maps events into logical window coordinates; the existing
              * controls are drawn in the centre viewport. */
             if(e.type==SDL_MOUSEBUTTONDOWN || e.type==SDL_MOUSEBUTTONUP)
