@@ -10,6 +10,7 @@
 *.sigmf-meta
 *.png
 !/docs/images/pal-color-reception.png
+!/docs/images/pe1cvj-1247mhz-fixed-stack.png
 !/docs/images/weak-signal-2387mhz-rolling-stack.png
 *.jpg
 *.jpeg

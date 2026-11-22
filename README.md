@@ -495,6 +495,12 @@ Incomplete or unreliable pictures are rejected. `HOLD` preserves the current
 result while waiting for usable fields; `SKIP` counts pictures skipped by a
 busy stacking worker, while `DROPS` counts discontinuities in the IQ stream.
 
+![PE1CVJ test card visible in the completed fixed stack on the left, with the noisy live picture on the right](docs/images/pe1cvj-1247mhz-fixed-stack.png)
+
+*PE1CVJ on 1247.600 MHz, received at 8 MS/s in the live stacking mode for
+sample rates up to 10 MS/s. Averaging 25 fields makes the callsign readable
+in the left pane. In the live picture on the right, it is barely discernible.*
+
 Above **10 MS/s**, press **S** for a lightweight rolling average of the last
 **six displayed pictures** (about 120 ms), and press S again to return immediately to live
 video. This keeps RGB colour and the full TV area, without the separate live
