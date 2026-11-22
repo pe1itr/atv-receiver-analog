@@ -38,7 +38,7 @@ int main(void)
     DiagnosticLog *log=diagnostic_log_create(snapshot,NULL); assert(log);
     diagnostic_log_toggle(log);
     assert(diagnostic_log_state(log)==DIAG_RECORDING && snapshots==1);
-    diagnostic_log_screenshot(log,"initial-test.png",1);
+    diagnostic_log_screenshot(log,"initial-test.png","","");
     for(unsigned i=1;i<=30;++i) { clock_ms+=1000; diagnostic_log_poll(log); }
     wait_saved(log); assert(snapshots==31);
     char first[4352]; strcpy(first,diagnostic_log_path(log));

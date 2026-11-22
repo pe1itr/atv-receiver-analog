@@ -10,7 +10,8 @@ DiagnosticLog *diagnostic_log_create(DiagnosticSnapshot snapshot,void *opaque);
 void diagnostic_log_toggle(DiagnosticLog *log);
 void diagnostic_log_poll(DiagnosticLog *log);
 /* Attach the separately saved initial screenshot while recording. */
-void diagnostic_log_screenshot(DiagnosticLog *log,const char *path,int saved);
+const char *diagnostic_log_directory(DiagnosticLog *log);
+void diagnostic_log_screenshot(DiagnosticLog *log,const char *path,const char *error,const char *capture_issue);
 int diagnostic_log_state(DiagnosticLog *log);
 unsigned diagnostic_log_remaining(DiagnosticLog *log);
 /* Valid when SAVED or ERROR; UTF-8 absolute path / error description. */

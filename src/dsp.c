@@ -26,8 +26,10 @@ static int echo_tracking(const Decoder *d)
 static void horizontal_clock(Decoder *d, double origin, double period)
 {
     if(echo_tracking(d) &&
-       fabs(remainder(origin-d->free_origin,d->free_period))>=d->rate*2e-6)
+       fabs(remainder(origin-d->free_origin,d->free_period))>=d->rate*2e-6) {
+        d->sync_evidence.h_result="echo_phase_rejected";
         return;
+    }
     if(d->hsync_updates>=4 && d->fields-d->hsync_field<=3) {
         double error=remainder(origin-d->free_origin,d->free_period);
         /* A weak field fit can move several microseconds without losing the
@@ -52,7 +54,7 @@ static void folded_horizontal(Decoder *d, double period)
     for(int part=0;part<3;++part) {
         double profile[128], score[128];
         for(int k=0;k<128;++k) {
-            if(d->hsync_samples[part][k]<8) return;
+            if(d->hsync_samples[part][k]<8) { d->sync_evidence.h_result="fold_insufficient_samples"; return; }
             profile[k]=d->hsync_sum[part][k]/d->hsync_samples[part][k];
         }
         int best=0;
@@ -92,12 +94,12 @@ static void folded_horizontal(Decoder *d, double period)
         phase[part]=phase[first]+remainder(phase[part]-phase[first],period);
         last=part; ++count; mean+=phase[part]; position+=part;
     }
-    if(count<2) return;
-    if(count==3 && fabs(phase[2]-2*phase[1]+phase[0])>period/64) return;
+    if(count<2) { d->sync_evidence.h_result="fold_insufficient_contrast"; return; }
+    if(count==3 && fabs(phase[2]-2*phase[1]+phase[0])>period/64) { d->sync_evidence.h_result="fold_inconsistent_phase"; return; }
     double span=d->rate*.020/3;
     double slope=(phase[last]-phase[first])/((last-first)*span);
     double next_period=period/(1-slope);
-    if(fabs(next_period/(d->rate/d->line_hz)-1)>=.002) return;
+    if(fabs(next_period/(d->rate/d->line_hz)-1)>=.002) { d->sync_evidence.h_result="fold_line_rate_rejected"; return; }
     double at_end=mean/count+slope*span*(2.5-position/count);
     double origin=d->tick+remainder(at_end-d->tick,period)/(1-slope);
     if(!d->hsync_updates || d->fields-d->hsync_field>3) {
@@ -110,8 +112,9 @@ static void folded_horizontal(Decoder *d, double period)
         d->hsync_candidate_origin=origin;
         d->hsync_candidate_period=next_period;
         d->hsync_candidate_field=d->fields;
-        if(++d->hsync_confirmations<3) return;
+        if(++d->hsync_confirmations<3) { d->sync_evidence.h_result="fold_awaiting_confirmation"; return; }
     }
+    d->sync_evidence.h_result="fold_confirmed";
     horizontal_clock(d,origin,next_period);
 }
 
@@ -144,6 +147,8 @@ static void free_horizontal(Decoder *d)
         }
         if(nearby>=24 && nearby>=.75*best) { best=nearby; centre=near_centre; }
     }
+    d->sync_evidence.h_pulses=d->hsync_count;
+    d->sync_evidence.h_consensus=best;
     if(best>=24 && best>=(tracking?.4:.6)*d->hsync_count) {
         double phase=(centre+.5)*period/128, sx=0, sy=0, sxx=0, sxy=0, syy=0;
         unsigned n=0;
@@ -163,6 +168,7 @@ static void free_horizontal(Decoder *d)
             double next_period=period/(1-slope);
             if(sqrt(error)<.8e-6*d->rate &&
                fabs(next_period/(d->rate/d->line_hz)-1)<.002) {
+                d->sync_evidence.h_result="pulses_confirmed";
                 horizontal_clock(d,d->tick+remainder(phase+intercept-d->tick,period)/(1-slope),next_period);
             }
         }
@@ -190,14 +196,23 @@ static void vertical_candidate(Decoder *d, uint64_t onset)
      * a group after a fade must agree with the predicted phase. */
     int consistent=d->vsync_count && steps>=1 && steps<=100 &&
         fabs(interval-steps*period)<d->rate*80e-6;
-    if(!consistent || (!d->vsync_updates && steps!=1)) d->vsync_count=0;
+    ++d->sync_evidence.v_candidates;
+    int reset=d->vsync_count && (!consistent || (!d->vsync_updates && steps!=1));
+    if(reset) {
+        ++d->sync_evidence.v_timing_resets;
+        d->vsync_count=0;
+    }
     if(d->vsync_count==8) {
         memmove(d->vsync_times,d->vsync_times+1,7*sizeof(double));
         --d->vsync_count;
     }
     d->vsync_times[d->vsync_count++]=onset;
     d->vsync_last=onset;
-    if(d->vsync_count<3) return;
+    d->sync_evidence.v_group_length=d->vsync_count;
+    if(d->vsync_count<3) {
+        d->sync_evidence.v_result=reset?"group_timing_mismatch":"awaiting_three_groups";
+        return;
+    }
     double sx=0,sy=0,sxx=0,sxy=0;
     for(unsigned k=0;k<d->vsync_count;++k) {
         double y=d->vsync_times[k]-d->vsync_times[0];
@@ -205,9 +220,11 @@ static void vertical_candidate(Decoder *d, uint64_t onset)
         sx+=x; sy+=y; sxx+=x*x; sxy+=x*y;
     }
     double n=d->vsync_count, denom=sxx-sx*sx/n;
-    if(denom<=0) return;
+    if(denom<=0) { d->sync_evidence.v_result="degenerate_period_fit"; return; }
     double fitted=(sxy-sx*sy/n)/denom;
-    if(fitted<d->rate/51 || fitted>d->rate/49) return;
+    if(fitted<d->rate/51 || fitted>d->rate/49) {
+        d->sync_evidence.v_result="field_rate_outside_49_51_hz"; return;
+    }
     double origin=d->vsync_times[0]+(sy-fitted*sx)/n+
         round((onset-d->vsync_times[0])/period)*fitted;
     double phase_error=remainder(origin-d->field,period);
@@ -233,6 +250,8 @@ static void vertical_candidate(Decoder *d, uint64_t onset)
     d->vsync_period=fitted;
     d->vsync_confirmed=onset;
     ++d->vsync_updates;
+    ++d->sync_evidence.v_confirmations;
+    d->sync_evidence.v_result="confirmed";
 }
 
 /* Average the broad PAL sync group before thresholding, so fragmented pulses
@@ -246,7 +265,12 @@ static void vertical_sample(Decoder *d, float v)
          * feature may pass the pulse test before the real broad sync. Never
          * let that first candidate suppress the rest of the field. Keep the
          * three-field timing confirmation in vertical_candidate afterwards. */
+        ++d->sync_evidence.v_scans;
         if(d->vsync_scan_best) vertical_candidate(d,d->vsync_scan_peak);
+        else if(!d->vsync_scan_depth_seen) d->sync_evidence.v_result="broad_pulse_too_shallow";
+        else if(!d->vsync_scan_contrast_seen) d->sync_evidence.v_result="broad_pulse_low_contrast";
+        else d->sync_evidence.v_result="awaiting_completed_pulse";
+        d->vsync_scan_depth_seen=d->vsync_scan_contrast_seen=0;
         d->vsync_scan_tick=d->tick;
         d->vsync_scan_best=0;
     }
@@ -269,9 +293,15 @@ static void vertical_sample(Decoder *d, float v)
      * Once line timing is independently confirmed, accept a smaller contrast;
      * retain the negative-level test and three-field timing confirmation. */
     double threshold=d->hsync_updates && d->fields-d->hsync_field<=2 ? .035 : .06;
-    if(middle<-.06 && score>threshold && score>d->vsync_best) {
-        d->vsync_best=score;
-        d->vsync_peak=d->tick-(uint64_t)llround(d->rate*224e-6);
+    if(middle<-.06) {
+        d->vsync_scan_depth_seen=1;
+        if(score>threshold) {
+            d->vsync_scan_contrast_seen=1;
+            if(score>d->vsync_best) {
+                d->vsync_best=score;
+                d->vsync_peak=d->tick-(uint64_t)llround(d->rate*224e-6);
+            }
+        }
     }
     if(d->vsync_best && d->tick-d->vsync_peak>d->rate*400e-6) {
         if(d->vsync_best>d->vsync_scan_best) {

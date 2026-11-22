@@ -17,6 +17,7 @@
 #include "iq_power.h"
 #include "diagnostic_log.h"
 #include <unistd.h>
+#include <fcntl.h>
 #include <SDL.h>
 #include <fftw3.h>
 #include <math.h>
@@ -117,6 +118,7 @@ typedef struct {
     /* Observed at decoder frame callbacks, retained between F10 snapshots. */
     uint64_t horizontal_losses, vertical_losses, sync_losses, frame_stalls;
     uint32_t max_frame_gap_ms;
+    SyncEvidence sync_evidence;
     int sync_observed, have_hsync, have_vsync;
     uint64_t horizontal_age_fields;
     double vertical_age_ms;
@@ -226,7 +228,9 @@ static int status_json(void *opaque,char *out,size_t capacity)
         "\"video\":{\"signal_dbfs\":%.12g,\"if_signal_dbfs\":%s,\"if_signal_age_ms\":%u,\"fields\":%u,\"discontinuities\":%u,"
         "\"sync_locked\":%s,\"color_enabled\":%s,\"color_locked\":%s,\"free_sync\":%s,\"line_hz\":%.12g,\"vertical_shift_lines\":%d,\"horizontal_locked\":%s,\"vertical_locked\":%s,\"raster_hz\":%.12g,\"age_ms\":%u,\"consumed_samples\":%llu},"
         "\"sync_diagnostics\":{\"indicator_reason\":\"%s\",\"horizontal_losses\":%llu,\"vertical_losses\":%llu,\"combined_losses\":%llu,"
-        "\"horizontal_age_fields\":%s,\"vertical_age_ms\":%s,\"completed_frame_stalls\":%llu,\"max_completed_frame_gap_ms\":%u},"
+        "\"horizontal_age_fields\":%s,\"vertical_age_ms\":%s,\"completed_frame_stalls\":%llu,\"max_completed_frame_gap_ms\":%u,"
+        "\"h_decision\":\"%s\",\"h_pulses\":%u,\"h_consensus\":%u,\"v_decision\":\"%s\",\"v_last_candidate_chain\":%u,"
+        "\"v_scans\":%llu,\"v_candidates\":%llu,\"v_timing_resets\":%llu,\"v_confirmations\":%llu},"
         "\"clipping\":{\"active\":%s,\"repeated\":%s,\"clipped_samples\":%llu,\"inspected_samples\":%llu,\"last_clip_age_ms\":%u},"
         "\"video_quality\":{\"valid\":%s,\"age_ms\":%u,\"video_snr_db\":%s,\"noise_rms\":%s,"
         "\"sync_depth\":%s,\"sync_depth_error\":%s,\"reason\":\"%s\","
@@ -254,6 +258,10 @@ static int status_json(void *opaque,char *out,size_t capacity)
         a->last_frame?SDL_GetTicks()-a->last_frame:0,(unsigned long long)a->consumed_samples,
         sync_indicator_reason(a,now),(unsigned long long)a->horizontal_losses,(unsigned long long)a->vertical_losses,
         (unsigned long long)a->sync_losses,h_age,v_age,(unsigned long long)a->frame_stalls,a->max_frame_gap_ms,
+        a->sync_evidence.h_result?a->sync_evidence.h_result:"pending",a->sync_evidence.h_pulses,a->sync_evidence.h_consensus,
+        a->sync_evidence.v_result?a->sync_evidence.v_result:"pending",a->sync_evidence.v_group_length,
+        (unsigned long long)a->sync_evidence.v_scans,(unsigned long long)a->sync_evidence.v_candidates,
+        (unsigned long long)a->sync_evidence.v_timing_resets,(unsigned long long)a->sync_evidence.v_confirmations,
         B(clipping_active(&a->clipping,SDL_GetTicks())),
         B(clipping_repeated(&a->clipping,SDL_GetTicks())),
         (unsigned long long)a->clipping.clipped_samples,(unsigned long long)a->clipping.samples,
@@ -347,6 +355,8 @@ static int diagnostic_snapshot(void *opaque,char *out,size_t capacity)
         "FM%d/D%d; inversion=%d; PAL de-emphasis=%d; experimental sync=%d; free sync=%d\n"
         "Sync: H=%d V=%d combined=%d; video fresh=%d age=%u ms; raster=%.6f Hz (0=unavailable)\n"
         "Sync indicator: %s; cumulative observed losses H=%llu V=%llu combined=%llu; completed frame gaps >=150 ms=%llu max=%u ms\n"
+        "Latest H decision: %s (pulses in consensus %u of %u); latest V scan: %s (last candidate chain %u)\n"
+        "V totals since decoder init: scans=%llu candidates=%llu timing resets=%llu confirmed=%llu\n"
         "Color: enabled=%d locked=%d; IF level=%s age=%u ms; Video-SNR=%s\n"
         "Consumed throughput: %s; total samples=%llu; queue=%.3f ms (peak=%.3f ms)\n"
         "Cumulative: discontinuities=%u discarded=%llu hardware overflows=%llu; clipping samples=%llu\n"
@@ -362,6 +372,10 @@ static int diagnostic_snapshot(void *opaque,char *out,size_t capacity)
         a->horizontal_locked,a->vertical_locked,a->sync_locked,fresh,a->last_frame?now-a->last_frame:0,a->raster_hz,
         sync_indicator_reason(a,now),(unsigned long long)a->horizontal_losses,(unsigned long long)a->vertical_losses,
         (unsigned long long)a->sync_losses,(unsigned long long)a->frame_stalls,a->max_frame_gap_ms,
+        a->sync_evidence.h_result?a->sync_evidence.h_result:"pending",a->sync_evidence.h_consensus,a->sync_evidence.h_pulses,
+        a->sync_evidence.v_result?a->sync_evidence.v_result:"pending",a->sync_evidence.v_group_length,
+        (unsigned long long)a->sync_evidence.v_scans,(unsigned long long)a->sync_evidence.v_candidates,
+        (unsigned long long)a->sync_evidence.v_timing_resets,(unsigned long long)a->sync_evidence.v_confirmations,
         color_enabled(a->c.rate,a->if_bandwidth),a->color_locked,if_text,
         isfinite(a->if_power_dbfs)?now-a->if_power_tick:0,snr,
         throughput_text,(unsigned long long)a->consumed_samples,
@@ -757,6 +771,7 @@ static void frame(void *opaque, const uint32_t *pixels)
             SDL_CondWait(a->stack_ready,a->mutex);
     if(!a->decoder->preview) memcpy(a->live, pixels, sizeof(a->live));
     a->color_locked=a->decoder->pal.last_lock && a->decoder->tick-a->decoder->pal.last_lock<a->c.rate*.002;
+    a->sync_evidence=a->decoder->sync_evidence;
     a->have_hsync=a->decoder->hsync_updates!=0;
     a->have_vsync=a->decoder->vsync_updates!=0;
     a->horizontal_age_fields=a->decoder->fields-a->decoder->hsync_field;
@@ -2071,43 +2086,93 @@ static int screenshot_expose(ScreenshotExposure *s,const View *v,uint32_t now)
     return 1;
 }
 
-/* Capture the completed backbuffer before SDL_RenderPresent. RGBA32 is
- * byte-ordered RGBA on either endian, as required by libpng's simple API. */
-static int save_window_png(SDL_Renderer *renderer,double frequency,char *path,size_t capacity)
+typedef struct {
+    char path[4352],error[512],capture_issue[256];
+} ScreenshotResult;
+
+/* Read the completed backbuffer before presentation. F10 can still save the
+ * receiver's live video when the graphics backend cannot read its window. */
+static SDL_Surface *capture_window(SDL_Renderer *renderer,char *issue,size_t capacity)
 {
-    struct timespec now; struct tm utc; char stamp[32]; int w,h;
-    if(clock_gettime(CLOCK_REALTIME,&now) || !gmtime_r(&now.tv_sec,&utc) ||
-       !strftime(stamp,sizeof(stamp),"%Y%m%dT%H%M%S",&utc)) {
-        fprintf(stderr,"Screenshot: cannot determine UTC time\n"); return -1;
-    }
+    SDL_RendererInfo info={0};
+    SDL_GetRendererInfo(renderer,&info);
+    const char *backend=info.name?info.name:"unknown renderer";
+    int w,h;
     if(SDL_GetRendererOutputSize(renderer,&w,&h)) {
-        fprintf(stderr,"Screenshot: %s\n",SDL_GetError()); return -1;
+        snprintf(issue,capacity,"output size (%s): %s",backend,SDL_GetError());
+        return NULL;
     }
     SDL_Surface *surface=SDL_CreateRGBSurfaceWithFormat(0,w,h,32,SDL_PIXELFORMAT_RGBA32);
     if(!surface || SDL_RenderReadPixels(renderer,NULL,SDL_PIXELFORMAT_RGBA32,surface->pixels,surface->pitch)) {
-        fprintf(stderr,"Screenshot: %s\n",SDL_GetError()); SDL_FreeSurface(surface); return -1;
+        snprintf(issue,capacity,"capture %dx%d (%s): %s",w,h,backend,SDL_GetError());
+        SDL_FreeSurface(surface);
+        return NULL;
     }
-    FILE *file=NULL;
+    return surface;
+}
+
+static int save_window_png(SDL_Renderer *renderer,double frequency,const char *directory,
+                           const uint32_t *live,ScreenshotResult *result)
+{
+    struct timespec now;
+    struct tm utc;
+    char stamp[32];
+    char *path=result->path, *error=result->error;
+    size_t capacity=sizeof(result->path),error_size=sizeof(result->error);
+    SDL_Surface *surface=NULL;
+    if(clock_gettime(CLOCK_REALTIME,&now) || !gmtime_r(&now.tv_sec,&utc) ||
+       !strftime(stamp,sizeof(stamp),"%Y%m%dT%H%M%S",&utc)) {
+        snprintf(error,error_size,"UTC filename: %s",strerror(errno));
+        goto fail;
+    }
+    surface=capture_window(renderer,result->capture_issue,sizeof(result->capture_issue));
+    if(!surface) {
+        if(!live) goto fail;
+        surface=SDL_CreateRGBSurfaceWithFormat(0,WIDTH,HEIGHT,32,SDL_PIXELFORMAT_RGBA32);
+        if(!surface || SDL_ConvertPixels(WIDTH,HEIGHT,SDL_PIXELFORMAT_ARGB8888,live,WIDTH*4,
+                                        SDL_PIXELFORMAT_RGBA32,surface->pixels,surface->pitch)) {
+            snprintf(error,error_size,"live video fallback: %s",SDL_GetError());
+            goto fail;
+        }
+    }
+    int fd=-1;
     for(unsigned suffix=0;suffix<1000;++suffix) {
-        int length=snprintf(path,capacity,"fm-atv-%.0fHz-%s-%03ldZ-%03u.png",
-            frequency,stamp,now.tv_nsec/1000000,suffix);
-        if(length<0 || (size_t)length>=capacity) break;
-        file=fopen(path,"wbx");
-        if(file || errno!=EEXIST) break;
+        int length=snprintf(path,capacity,"%sfm-atv-%.0fHz-%s-%03ldZ-%03u.png",
+            directory,frequency,stamp,now.tv_nsec/1000000,suffix);
+        if(length<0 || (size_t)length>=capacity) {
+            snprintf(error,error_size,"screenshot path too long");
+            goto fail;
+        }
+#ifdef _WIN32
+        fd=_open(path,_O_WRONLY|_O_CREAT|_O_EXCL|_O_BINARY,_S_IREAD|_S_IWRITE);
+#else
+        fd=open(path,O_WRONLY|O_CREAT|O_EXCL,0600);
+#endif
+        if(fd>=0 || errno!=EEXIST) break;
     }
+    if(fd<0) {
+        snprintf(error,error_size,"create file: %s",strerror(errno));
+        goto fail;
+    }
+    FILE *file=fdopen(fd,"wb");
     if(!file) {
-        fprintf(stderr,"Screenshot: cannot create file: %s\n",strerror(errno));
-        SDL_FreeSurface(surface); return -1;
+        snprintf(error,error_size,"open binary stream: %s",strerror(errno));
+        close(fd); remove(path); goto fail;
     }
     png_image png={0}; png.version=PNG_IMAGE_VERSION;
-    png.width=w; png.height=h; png.format=PNG_FORMAT_RGBA;
-    int ok=png_image_write_to_stdio(&png,file,0,surface->pixels,surface->pitch,NULL);
-    if(!ok) fprintf(stderr,"Screenshot: %s\n",png.message);
-    if(fclose(file)) { fprintf(stderr,"Screenshot: %s\n",strerror(errno)); ok=0; }
-    png_image_free(&png); SDL_FreeSurface(surface);
-    if(!ok) { remove(path); return -1; }
+    png.width=surface->w; png.height=surface->h; png.format=PNG_FORMAT_RGBA;
+    if(!png_image_write_to_stdio(&png,file,0,surface->pixels,surface->pitch,NULL))
+        snprintf(error,error_size,"encode PNG: %s",png.message);
+    png_image_free(&png);
+    if(fclose(file) && !*error) snprintf(error,error_size,"close file: %s",strerror(errno));
+    if(*error) { remove(path); goto fail; }
+    SDL_FreeSurface(surface);
     fprintf(stderr,"Screenshot saved: %s\n",path);
     return 0;
+fail:
+    SDL_FreeSurface(surface);
+    fprintf(stderr,"Screenshot failed (%s): %s %s\n",*path?path:directory,result->capture_issue,error);
+    return -1;
 }
 
 static void help(void)
@@ -2770,16 +2835,17 @@ configure_receiver:
         draw_side_panels(r,v,save_notice,save_result,screenshot_notice,if_notice);
         draw_diagnosis(r,diagnosis);
         if(diagnostic_screenshot_requested) {
-            char path[160];
-            int saved=save_window_png(r,v->actual_hz+v->c.lo,path,sizeof(path))==0;
-            diagnostic_log_screenshot(diagnosis,path,saved);
+            ScreenshotResult shot={0};
+            const char *directory=diagnostic_log_directory(diagnosis);
+            save_window_png(r,v->actual_hz+v->c.lo,directory,v->stacking?v->live:v->pixels,&shot);
+            diagnostic_log_screenshot(diagnosis,*shot.path?shot.path:directory,shot.error,shot.capture_issue);
             diagnostic_screenshot_requested=0;
         }
         if(screenshot_ready) {
-            char path[160];
+            ScreenshotResult shot={0};
             if(photo) fprintf(stderr,"Screenshot exposure: %u distinct displayed fields over %u ms\n",
                 exposure->count,SDL_GetTicks()-exposure->started);
-            save_window_png(r,v->actual_hz+v->c.lo,path,sizeof(path));
+            save_window_png(r,v->actual_hz+v->c.lo,"",NULL,&shot);
             screenshot_requested=0;
             free(exposure); exposure=NULL;
         }

@@ -62,7 +62,15 @@ typedef struct {
 void fm_demod_init(FMDemod *d, double rate, double deviation, int invert, unsigned stride);
 void fm_demod_process(FMDemod *d, const IQ *iq, float *video, size_t n);
 typedef void (*FrameFn)(void *, const uint32_t *);
+/* Most recent completed detector decisions; totals since decoder initialization. */
+typedef struct {
+    const char *h_result, *v_result;
+    unsigned h_pulses, h_consensus, v_group_length;
+    uint64_t v_scans, v_candidates, v_timing_resets, v_confirmations;
+} SyncEvidence;
+
 typedef struct Decoder {
+    SyncEvidence sync_evidence;
     double rate, deviation, line_hz;
     int free_sync, vertical_shift, experimental_sync;
     int invert, previous_valid, low, have_field, have_line, row, column;
@@ -96,6 +104,7 @@ typedef struct Decoder {
     /* Full-field candidate selection, independent of raster phase. */
     uint64_t vsync_scan_tick, vsync_scan_peak;
     double vsync_scan_best;
+    int vsync_scan_depth_seen, vsync_scan_contrast_seen;
     uint32_t pixels[WIDTH * HEIGHT];
     uint32_t guide_pixels[WIDTH * HEIGHT];
     float guide_pi, guide_pq, guide_filtered;

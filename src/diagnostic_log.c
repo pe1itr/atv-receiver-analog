@@ -92,7 +92,7 @@ struct DiagnosticLog {
     unsigned count;
     CpuSample previous_cpu;
     const char *reason;
-    char directory[4096],path[4352],error[256],screenshot[256];
+    char directory[4096],path[4352],error[256],screenshot[5248];
     char samples[DIAGNOSTIC_SECONDS+1][SNAPSHOT_SIZE];
 };
 static int save_log(void *opaque)
@@ -122,6 +122,8 @@ static int save_log(void *opaque)
         "CPU usage is averaged between snapshots. One logical CPU fully used = 1.0 cores = 100%% of one CPU.\n"
         "Process total-capacity percentage divides by SDL's logical CPU count; system busy includes other programs.\n"
         "On Linux, system busy excludes idle and I/O-wait time. CPU averages do not identify individual busy threads.\n"
+        "SYNC lamp needs a completed frame younger than 150 ms, H confirmed within 5 fields and V confirmed within 100 ms (strict).\n"
+        "V acquisition requires three consecutive broad-pulse groups at PAL field timing. Detector totals restart on decoder initialization.\n"
         "AFC SEEK is not a reliable tuning-error estimate.\n"
         "Contains receiver settings and diagnostics; no IQ or decoded audio.\n"
         "Initial screenshot (separate PNG, send together with this TXT): %s\n\n",
@@ -151,10 +153,13 @@ unsigned diagnostic_log_remaining(DiagnosticLog *log)
 }
 const char *diagnostic_log_path(DiagnosticLog *log) { return log?log->path:""; }
 const char *diagnostic_log_error(DiagnosticLog *log) { return log?log->error:"Cannot allocate diagnosis recorder"; }
-void diagnostic_log_screenshot(DiagnosticLog *log,const char *path,int saved)
+const char *diagnostic_log_directory(DiagnosticLog *log) { return log->directory; }
+void diagnostic_log_screenshot(DiagnosticLog *log,const char *path,const char *error,const char *capture_issue)
 {
-    if(log && diagnostic_log_state(log)==DIAG_RECORDING)
-        snprintf(log->screenshot,sizeof(log->screenshot),"%s",saved?path:"FAILED - screenshot could not be saved");
+    if(!log || diagnostic_log_state(log)!=DIAG_RECORDING) return;
+    snprintf(log->screenshot,sizeof(log->screenshot),"%s%s%s%s%s%s",
+        *error?"FAILED - ":"",path,*error?" - ":"",error,
+        *capture_issue?(*error?" - window capture: ":" (live video fallback) - "):"",capture_issue);
 }
 static void capture(DiagnosticLog *log)
 {

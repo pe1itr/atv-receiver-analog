@@ -613,7 +613,10 @@ does not change settings or require the HTTP status server. Diagnostic text writ
 on a separate thread. The screen reports recording, saving, the saved filename or
 a save error. **Shift+F10** copies the full saved path for locating the file.
 Send the text file **and the initial screenshot PNG** to Rob for analysis. The
-text file names the screenshot and contains build/platform information,
+text file names the PNG in the same directory. If window capture fails, F10
+saves the video pixels and records the graphics error. File creation, encoding
+and write errors also appear in the text file alongside the destination.
+The recording contains build/platform information,
 settings, tuning and AFC state, sync, quality validity, clipping, queue and loss
 counters, process CPU usage, total system CPU busy percentage, logical CPU count,
 and raw JSON snapshots. CPU values are averages between snapshots; the first
@@ -622,7 +625,13 @@ and as a percentage of one CPU and of all reported logical CPUs. One fully used
 logical CPU is 1.0 core / 100% of one CPU. System CPU busy also includes other
 programs (Linux idle and I/O-wait time are excluded).
 Sync diagnostics explain whether the lamp is off because H sync, V sync, both,
-or a fresh video frame is missing (150 ms timeout). Cumulative H, V and combined
+or a fresh video frame is missing (150 ms timeout). Each snapshot includes the
+latest H decision, the number of pulses that agreed on line timing, and the V
+detector's last scan result. Compare V scan, candidate, timing-reset and
+confirmation totals across snapshots. For example, repeated candidates with
+timing resets indicate that groups were found but failed the timing check.
+These detector totals restart when the decoder is initialized.
+Cumulative H, V and combined
 lock-loss counters are updated at decoder frame callbacks, retaining observed
 losses even if sync recovers between snapshots. They start at zero for each
 receiver session; initial acquisition is not a loss. Decoder resets and setting
