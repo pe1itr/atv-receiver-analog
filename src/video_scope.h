@@ -4,9 +4,10 @@
 #include <stdint.h>
 
 #define VIDEO_SCOPE_POINTS 640
-/* Three PAL lines, including at the maximum supported 64 MS/s. */
+/* Bounded acquisition memory at all timebases and sample rates. */
 #define VIDEO_SCOPE_CAPACITY 16384
-enum { SCOPE_TV, SCOPE_LINE, SCOPE_FIELD };
+#define VIDEO_SCOPE_SCALES 9
+extern const unsigned video_scope_us_per_div[VIDEO_SCOPE_SCALES];
 typedef struct {
     float low[VIDEO_SCOPE_POINTS], high[VIDEO_SCOPE_POINTS];
     float minimum, maximum;
@@ -18,7 +19,7 @@ typedef struct {
     float samples[VIDEO_SCOPE_CAPACITY];
     size_t count, wanted, skip, stride, partial;
     double partial_sum;
-    int field;
+    unsigned timebase;
     double rate, line_hz;
     VideoScopeReading reading;
 } VideoScope;

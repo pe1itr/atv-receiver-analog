@@ -20,7 +20,7 @@ Selecteer in Zadig alleen de HackRF.
 
 BEDIENING
 ! = toetsenuitleg, pijltjes omhoog/omlaag = gain, N = geluidsbron,
-A = dempen, O = tv / lijnscoop / verticale-syncscoop, P = screenshot, Q of Esc = afsluiten.
+A = dempen, O = tv/scoop, PgDn/PgUp = kortere/langere tijdbasis, P = screenshot, Q of Esc = afsluiten.
 S = stacking aan/uit; boven 10 MS/s: rolling 6 beelden in kleur, volledig tv-vlak.
 F9 = IQ-opname starten/stoppen; standaard 3 seconden, automatisch opslaan.
 F10 = screenshot en 30 seconden diagnose opnemen; nogmaals drukken stopt eerder.

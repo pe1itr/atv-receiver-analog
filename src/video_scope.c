@@ -3,6 +3,8 @@
 #include <math.h>
 #include <string.h>
 
+const unsigned video_scope_us_per_div[VIDEO_SCOPE_SCALES]={16,32,64,128,250,500,1000,2500,5000};
+
 void video_scope_init(VideoScope *s,double rate,double line_hz)
 {
     memset(s,0,sizeof(*s)); s->rate=rate;
@@ -13,16 +15,17 @@ void video_scope_reset(VideoScope *s,double line_hz)
     s->count=s->skip=s->partial=0;
     s->partial_sum=0;
     s->line_hz=line_hz;
-    /* Average about 2 us per sample to fit a full PAL field plus trigger margins. */
-    s->stride=s->field?(size_t)fmax(1,round(s->rate*2e-6)):1;
-    s->wanted=(size_t)ceil((s->field?.022:3/line_hz)*s->rate/s->stride);
-    if(s->wanted>VIDEO_SCOPE_CAPACITY) s->wanted=VIDEO_SCOPE_CAPACITY;
+    double span=video_scope_us_per_div[s->timebase]*8e-6;
+    /* Allow one trigger period before the displayed interval. */
+    double capture=span+(span>=.001?.0201:1/line_hz);
+    s->stride=(size_t)ceil(capture*s->rate/VIDEO_SCOPE_CAPACITY);
+    s->wanted=(size_t)ceil(capture*s->rate/s->stride);
     memset(&s->reading,0,sizeof(s->reading));
 }
 static void acquire(VideoScope *s)
 {
     /* Smooth only the trigger detector; keep the displayed samples intact.
-     * A pulse trigger indicates a plausible horizontal pulse, not PAL lock. */
+     * A pulse trigger indicates a plausible pulse, not PAL lock. */
     float smooth[VIDEO_SCOPE_CAPACITY], lo=FLT_MAX, hi=-FLT_MAX;
     double rate=s->rate/s->stride;
     size_t window=(size_t)fmax(1,round(rate*.3e-6));
@@ -33,8 +36,10 @@ static void acquire(VideoScope *s)
         smooth[k]=(float)(sum/(k<window?k+1:window));
         lo=fminf(lo,smooth[k]); hi=fmaxf(hi,smooth[k]);
     }
-    size_t span=(size_t)llround((s->field?16:2)*rate/s->line_hz);
-    size_t pre=(size_t)llround(rate*(s->field?.00032:4e-6));
+    double span_seconds=video_scope_us_per_div[s->timebase]*8e-6;
+    int broad=span_seconds>=.001;
+    size_t span=(size_t)llround(span_seconds*rate);
+    size_t pre=(size_t)llround(rate*(broad?.00032:4e-6));
     size_t start=0,fall=0;
     int low=0,triggered=0;
     float threshold=lo+.25f*(hi-lo);
@@ -42,13 +47,12 @@ static void acquire(VideoScope *s)
         if(!low && smooth[k]<threshold && smooth[k-1]>=threshold) { fall=k; low=1; }
         if(low && smooth[k]>=threshold) {
             double width=(k-fall)/rate;
-            if(width>=(s->field?20e-6:3e-6) && width<=(s->field?31e-6:7e-6) && fall>=pre && fall-pre+span<=s->wanted) {
+            if(width>=(broad?20e-6:3e-6) && width<=(broad?31e-6:7e-6) && fall>=pre && fall-pre+span<=s->wanted) {
                 start=fall-pre; triggered=1; break;
             }
             low=0;
         }
     }
-    if(s->field && !triggered) span=s->wanted;
     if(span>s->wanted) span=s->wanted;
     VideoScopeReading *r=&s->reading;
     r->triggered=triggered;
@@ -77,7 +81,7 @@ int video_scope_process(VideoScope *s,const float *video,size_t count)
     }
     size_t needed=(s->wanted-s->count)*s->stride-s->partial;
     size_t take=count<needed?count:needed;
-    if(!s->field) {
+    if(s->stride==1) {
         for(size_t k=0;k<take;++k)
             s->samples[s->count++]=isfinite(video[k])?video[k]:0;
     } else {
