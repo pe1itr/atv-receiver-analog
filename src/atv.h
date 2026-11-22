@@ -130,6 +130,8 @@ void decoder_process(Decoder *d, const IQ *iq, size_t n);
 /* Both inputs must have the same sample clock and filter delay. */
 void decoder_process_guided(Decoder *d, const IQ *iq, const IQ *guide, size_t n);
 /* Pre-demodulated inputs retain one value for every original IQ sample. */
+void decoder_process_prepared(Decoder *d, const float *video, const float *guide,
+                              const PalComponents *prepared, size_t n);
 void decoder_process_video(Decoder *d, const float *video, const float *guide, size_t n);
 typedef struct {
     uint32_t sum[WIDTH * HEIGHT];

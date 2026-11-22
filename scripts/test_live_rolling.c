@@ -50,6 +50,18 @@ int main(void)
     feed(a,0xff000000); assert(!a->stack.rolling && a->stack.count==0);
     SDL_LockMutex(a->mutex); stack_action(a,6); SDL_UnlockMutex(a->mutex);
     feed(a,0xffabcdef); assert(a->stack.count==1 && a->pixels[0]==0xffabcdef);
+    View *v=calloc(1,sizeof(*v)); assert(v);
+    capture_view(a,v);
+    assert(v->pixels[0]==0xffabcdef && v->live[0]==0xffabcdef);
+    SDL_LockMutex(a->mutex); stack_action(a,1); SDL_UnlockMutex(a->mutex);
+    feed(a,0xff2468ac);
+    capture_view(a,v);
+    assert(!v->stacking && v->pixels[0]==0xff2468ac);
+    d->preview=NULL;
+    feed(a,0xff345678);
+    capture_view(a,v);
+    assert(v->pixels[0]==0xff345678);
+    free(v);
     SDL_AtomicSet(&a->stop,1); SDL_CondBroadcast(a->stack_ready); SDL_WaitThread(thread,NULL);
     SDL_DestroyCond(a->stack_ready); SDL_DestroyMutex(a->mutex); free(d); free(a); SDL_Quit();
     puts("Live rolling: five-picture RGB eviction, no frame gating, preview once, pause, resize and fixed/rolling switch OK");

@@ -1,4 +1,5 @@
 #include "alignment.h"
+#include "pal_pipeline.h"
 #include "afc.h"
 #include "sound.h"
 #include "nicam.h"
@@ -583,7 +584,8 @@ static void capture_view(App *a, View *v)
     v->c.invert=a->invert;
     v->c.video_deemphasis=a->video_deemphasis;
     v->c.experimental_sync=a->experimental_sync;
-    memcpy(v->pixels,a->stacking && !a->stack.count?a->live:a->pixels,sizeof(v->pixels));
+    int show_stack=(a->stacking && a->stack.count) || a->light_stacking;
+    memcpy(v->pixels,show_stack?a->pixels:a->live,sizeof(v->pixels));
     if(a->stacking) memcpy(v->live,a->live,sizeof(v->live));
     memcpy(v->spectrum,a->spectrum,sizeof(v->spectrum));
 #define COPY_VIEW(name) v->name=a->name
@@ -778,7 +780,6 @@ static void live_frame(void *opaque, const uint32_t *pixels)
     SDL_LockMutex(a->mutex);
     memcpy(a->live,pixels,sizeof(a->live));
     if(a->light_stacking || (a->stacking && a->stack.rolling && a->c.rate<=10e6)) queue_light_frame(a,pixels);
-    else if(!a->stacking) memcpy(a->pixels,pixels,sizeof(a->pixels));
     SDL_UnlockMutex(a->mutex);
 }
 static void frame(void *opaque, const uint32_t *pixels)
@@ -833,8 +834,7 @@ static void frame(void *opaque, const uint32_t *pixels)
     if(a->light_stacking || live_rolling) {
         if(!a->decoder->preview) queue_light_frame(a,a->live);
     }
-    else if (!a->stacking) memcpy(a->pixels, a->live, sizeof(a->pixels));
-    else if(!a->command && !a->stack_paused && !SDL_AtomicGet(&a->failed)) {
+    else if(a->stacking && !a->command && !a->stack_paused && !SDL_AtomicGet(&a->failed)) {
         if(a->stack_pending) ++a->stack_skipped;
         memcpy(a->queued.pixels,pixels,sizeof(a->queued.pixels));
         a->queued.lightweight=0;
@@ -1081,12 +1081,12 @@ static void reset_audio(Playback *p, Alignment *video, double bandwidth)
 }
 
 /* Drain a pending block before a discontinuity, control change or EOF. */
-static void finish_video(Decoder *d, Alignment *video, Alignment *guide, size_t *pending)
+static void finish_video(PalPipeline *pal, Decoder *d, Alignment *video, Alignment *guide, size_t *pending)
 {
     if(!*pending) return;
     const float *v=alignment_wait(video);
     const float *g=guide?alignment_wait(guide):NULL;
-    decoder_process_video(d,v,g,*pending);
+    pal_pipeline_decode(pal,d,v,g,*pending);
     *pending=0;
 }
 static void publish_video_quality(App *a,const VideoQuality *q)
@@ -1117,8 +1117,7 @@ static int worker(void *opaque)
     Alignment *video_path=NULL;
     size_t pending=0;
     Alignment *alignment=NULL;
-    float *video=malloc(a->c.rx_block*sizeof(*video));
-    float *guide=malloc(a->c.rx_block*sizeof(*guide));
+    PalPipeline *pal=NULL;
     FILE *record_file=NULL;
     IQ *recorded=NULL;
     size_t record_count=0,record_capacity=0;
@@ -1131,7 +1130,7 @@ static int worker(void *opaque)
         /* Touch pages before receiving, avoiding page faults during capture. */
         memset(recorded,0,record_capacity*sizeof(*recorded));
     }
-    if (!iq || !d || !preview || !in || !out || !video || !guide) goto fail;
+    if (!iq || !d || !preview || !in || !out) goto fail;
     plan = fftwf_plan_dft_1d(FFT_SIZE, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
     if (!plan) goto fail;
     SDL_LockMutex(a->mutex);
@@ -1139,6 +1138,7 @@ static int worker(void *opaque)
     SDL_UnlockMutex(a->mutex);
     init_decoders(a,d,preview,a->c.invert,a->c.free_sync,a->c.line_hz,initial_vertical_shift,a->c.if_bandwidth,a->c.video_deemphasis,a->c.experimental_sync);
     a->decoder=d;
+    if(d->color && a->c.rx_block>PAL_CHUNK && !(pal=pal_pipeline_create())) goto fail;
     video_path=alignment_create_video(a->c.rate,a->c.if_bandwidth,a->c.deviation,a->c.invert,a->c.rx_block,d->color);
     if(video_path && a->c.video_deemphasis && alignment_set_deemphasis(video_path)) {
         alignment_destroy(video_path); video_path=NULL;
@@ -1184,7 +1184,7 @@ static int worker(void *opaque)
             uint32_t pause_start=SDL_GetTicks();
             double pause_if=a->if_bandwidth;
             SDL_UnlockMutex(a->mutex);
-            finish_video(d,video_path,alignment,&pending);
+            finish_video(pal,d,video_path,alignment,&pending);
             source_pause(a->source);
             reset_audio(&audio,video_path,pause_if);
             SDL_LockMutex(a->mutex);
@@ -1210,14 +1210,14 @@ static int worker(void *opaque)
         if(epoch!=afc_epoch) { afc_reset(&afc,a->c.rate,line_hz); afc_epoch=epoch; }
         if(command) pending_timing=(BlockTiming){0};
         if(command & 4) {
-            finish_video(d,video_path,alignment,&pending);
+            finish_video(pal,d,video_path,alignment,&pending);
             reset_audio(&audio,video_path,if_bw);
             command&=~4;
         }
         if (command) {
             if(command & 9) spectrum_average.valid=0;
             iq_recorder_finish(a->recorder,"settings_changed");
-            finish_video(d,video_path,alignment,&pending);
+            finish_video(pal,d,video_path,alignment,&pending);
             afc_reset(&afc,a->c.rate,line_hz);
             if(!strcmp(a->c.mode,"sdrplay")) hz=fmin(2e9,fmax(1000,hz));
             if ((command & 9) && source_tune(a->source, &hz, &gain)) goto fail;
@@ -1240,6 +1240,7 @@ static int worker(void *opaque)
             video_scope_reset(&scope,line_hz);
             SDL_LockMutex(a->mutex); memset(&a->scope,0,sizeof(a->scope)); a->scope_tick=0; SDL_UnlockMutex(a->mutex);
             init_decoders(a,d,preview,invert,free_sync,line_hz,vertical_shift,if_bw,deemphasis,experimental_sync);
+            if(d->color && a->c.rx_block>PAL_CHUNK && !pal && !(pal=pal_pipeline_create())) goto fail;
             if(alignment) alignment_reset(alignment,invert);
             if (if_bw != applied_if || deemphasis != applied_deemphasis) {
                 alignment_destroy(video_path);
@@ -1261,7 +1262,7 @@ static int worker(void *opaque)
         uint64_t processing_start=SDL_GetPerformanceCounter();
         pending_timing.wait_ticks+=wait_ticks;
         pending_timing.read_overhead_ticks+=processing_start-read_start-wait_ticks;
-        if(n<=0) finish_video(d,video_path,alignment,&pending);
+        if(n<=0) finish_video(pal,d,video_path,alignment,&pending);
         if (n == -2 || n == -3) {
             pending_timing=(BlockTiming){0};
             spectrum_average.valid=0;
@@ -1329,21 +1330,22 @@ static int worker(void *opaque)
             SDL_UnlockMutex(a->mutex);
             next_fft = count + (uint64_t)(a->c.rate / 25);
         }
-        /* Copy completed block N before workers reuse their buffers for N+1.
-         * Colour/raster N then overlaps both IF/FM branches of N+1. */
+        /* Both branches can start N+1 as soon as their own N completes.
+         * The preceding outputs remain owned by the reader until next submit. */
+        if(alignment_queue(video_path,iq,(size_t)n)) goto fail;
+        if(alignment && alignment_queue(alignment,iq,(size_t)n)) goto fail;
         size_t ready=pending;
+        pending=(size_t)n;
+        const float *video=NULL,*guide=NULL;
         if(ready) {
-            memcpy(video,alignment_wait(video_path),ready*sizeof(*video));
             uint32_t measured_at;
-            double if_power=alignment_if_power(video_path,&measured_at);
+            double if_power;
+            video=alignment_previous(video_path,&if_power,&measured_at);
+            if(alignment) guide=alignment_previous(alignment,NULL,NULL);
             SDL_LockMutex(a->mutex);
             a->if_power_dbfs=if_power; a->if_power_tick=measured_at;
             SDL_UnlockMutex(a->mutex);
-            if(alignment) memcpy(guide,alignment_wait(alignment),ready*sizeof(*guide));
         }
-        if(alignment_submit(video_path,iq,(size_t)n)) goto fail;
-        if(alignment && alignment_submit(alignment,iq,(size_t)n)) goto fail;
-        pending=(size_t)n;
         if(ready) {
             uint64_t first_tick=d->tick;
             if(SDL_AtomicGet(&a->scope_enabled)) {
@@ -1357,7 +1359,7 @@ static int worker(void *opaque)
                     SDL_UnlockMutex(a->mutex);
                 }
             }
-            decoder_process_video(d,video,alignment?guide:NULL,ready);
+            pal_pipeline_decode(pal,d,video,guide,ready);
             video_quality_process(&quality,video,ready,first_tick,quality_sync_valid(d),
                 d->free_origin,d->free_period>0?d->free_period:d->rate/d->line_hz,
                 (double)d->field,d->vsync_period>0?d->vsync_period:d->rate/50);
@@ -1420,7 +1422,7 @@ cleanup:
     }
     if(d && a->decoder==d && d->color) fprintf(stderr,"PAL burst updates: %u; color lock: %s\n",d->pal.burst_updates,d->pal.locked?"yes":"no");
     free(recorded);
-    alignment_destroy(alignment); alignment_destroy(video_path); free(video); free(guide);
+    alignment_destroy(alignment); alignment_destroy(video_path); pal_pipeline_destroy(pal);
     stop_audio_worker(&audio);
     nicam_finish(audio.nicam);
     if(audio.sound) fprintf(stderr,"Audio DSP: input queue overflows %u; discarded samples %llu\n",audio.input_overflows,(unsigned long long)audio.discarded);

@@ -8,6 +8,11 @@ Alignment *alignment_create_video(double rate, double bandwidth, double deviatio
 /* Single caller; submit copies IQ. Exactly one outstanding block is allowed.
  * wait returns the held demodulated guide, valid until the next submit/reset. */
 int alignment_submit(Alignment *a, const IQ *iq, size_t n);
+/* Pipelined caller may queue one successor before consuming the preceding
+ * result. After submitting a successor, previous returns its predecessor.
+ * Consume the returned buffer before the next queue call reuses its slot. */
+int alignment_queue(Alignment *a, const IQ *iq, size_t n);
+const float *alignment_previous(Alignment *a, double *power, uint32_t *measured_at);
 const float *alignment_wait(Alignment *a);
 /* IQ power after the bandwidth filter, excluding DC, before FM;
  * NaN until first measurement. Independent of the FM DC-blocker setting.

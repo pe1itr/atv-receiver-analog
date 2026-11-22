@@ -108,7 +108,7 @@ static unsigned channel(float v)
     if(v>=1) return 255;
     return (unsigned)lrintf(v*255);
 }
-void pal_sample(PalDecoder *p, float composite, uint64_t tick, uint64_t line, int have_line)
+static void prepare_sample(PalDecoder *p, float composite, uint64_t tick)
 {
     if(!p->initialized || tick!=p->tick+1) {
         double phase=remainder(TAU*FSC*(double)tick/p->rate,TAU);
@@ -119,6 +119,31 @@ void pal_sample(PalDecoder *p, float composite, uint64_t tick, uint64_t line, in
         p->osc_s=p->osc_s*p->step_c+c*p->step_s;
     }
     p->tick=tick;
+    float y=p->notch_gain*(composite+p->notch_b*p->x1+p->x2)-p->notch_a*p->z1-.5625f*p->z2;
+    p->x2=p->x1; p->x1=composite; p->z2=p->z1; p->z1=y;
+    /* The complementary band-pass rejects luminance/DC before quadrature
+     * mixing, avoiding false colour ripple on neutral white and grey. */
+    float chroma=composite-y;
+    float u=2*chroma*p->osc_c, v=2*chroma*p->osc_s;
+    p->u1+=p->alpha*(u-p->u1); p->u2+=p->alpha*(p->u1-p->u2);
+    p->v1+=p->alpha*(v-p->v1); p->v2+=p->alpha*(p->v1-p->v2);
+    p->y1+=p->y_alpha*(y-p->y1); p->y2+=p->y_alpha*(p->y1-p->y2);
+    p->y_delay[p->delay_pos]=p->y2;
+    y=p->y_delay[(p->delay_pos+32-p->delay_samples)&31];
+    p->delay_pos=(p->delay_pos+1)&31;
+    /* Rotate/scale only when the raster emits a pixel, not at every IQ sample. */
+    p->out_y=y; p->out_u=p->u2; p->out_v=p->v2;
+}
+void pal_prepare_block(PalDecoder *p, const float *video, uint64_t tick, PalComponents *out, size_t n)
+{
+    for(size_t j=0;j<n;++j) {
+        prepare_sample(p,video[j],tick+j);
+        out[j]=(PalComponents){p->osc_c,p->osc_s,p->out_y,p->out_u,p->out_v};
+    }
+}
+
+static void track_sample(PalDecoder *p, float composite, uint64_t tick, uint64_t line, int have_line)
+{
     if(line!=p->line) {
         double distance=(double)line-(double)p->line;
         if(distance<p->rate*48e-6 || distance>p->rate*80e-6)
@@ -146,21 +171,23 @@ void pal_sample(PalDecoder *p, float composite, uint64_t tick, uint64_t line, in
     }
     if(have_line && elapsed>=p->rate*7.8e-6 && !p->gate_done) burst(p);
     if(!have_line) p->locked=0;
-    float y=p->notch_gain*(composite+p->notch_b*p->x1+p->x2)-p->notch_a*p->z1-.5625f*p->z2;
-    p->x2=p->x1; p->x1=composite; p->z2=p->z1; p->z1=y;
-    /* The complementary band-pass rejects luminance/DC before quadrature
-     * mixing, avoiding false colour ripple on neutral white and grey. */
-    float chroma=composite-y;
-    float u=2*chroma*p->osc_c, v=2*chroma*p->osc_s;
-    p->u1+=p->alpha*(u-p->u1); p->u2+=p->alpha*(p->u1-p->u2);
-    p->v1+=p->alpha*(v-p->v1); p->v2+=p->alpha*(p->v1-p->v2);
-    p->y1+=p->y_alpha*(y-p->y1); p->y2+=p->y_alpha*(p->y1-p->y2);
-    p->y_delay[p->delay_pos]=p->y2;
-    y=p->y_delay[(p->delay_pos+32-p->delay_samples)&31];
-    p->delay_pos=(p->delay_pos+1)&31;
-    /* Rotate/scale only when the raster emits a pixel, not at every IQ sample. */
-    p->out_y=y; p->out_u=p->u2; p->out_v=p->v2;
 }
+
+void pal_track_prepared(PalDecoder *p, const PalComponents *sample, float composite,
+                        uint64_t tick, uint64_t line, int have_line)
+{
+    p->tick=tick;
+    p->osc_c=sample->c; p->osc_s=sample->s;
+    p->out_y=sample->y; p->out_u=sample->u; p->out_v=sample->v;
+    track_sample(p,composite,tick,line,have_line);
+}
+
+void pal_sample(PalDecoder *p, float composite, uint64_t tick, uint64_t line, int have_line)
+{
+    prepare_sample(p,composite,tick);
+    track_sample(p,composite,tick,line,have_line);
+}
+
 uint32_t pal_rgb(const PalDecoder *p)
 {
     /* Constant reciprocals avoid serial divides for every output pixel.

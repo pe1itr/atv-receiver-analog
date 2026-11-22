@@ -601,7 +601,7 @@ void fm_demod_process(FMDemod *d, const IQ *iq, float *video, size_t n)
     }
 }
 static void process(Decoder *d, const IQ *iq, const IQ *guide,
-                    const float *video, const float *guide_video, size_t n)
+                    const float *video, const float *guide_video, const PalComponents *prepared, size_t n)
 {
     d->guided=(guide!=NULL || guide_video!=NULL) && !d->no_guide_raster;
     d->nominal_line_period=d->rate/d->line_hz;
@@ -655,7 +655,8 @@ static void process(Decoder *d, const IQ *iq, const IQ *guide,
 
         }
         if(d->free_sync) free_raster_clock(d,1);
-        if(d->color) pal_sample(&d->pal,v,d->tick,d->line,d->have_line);
+        if(prepared) pal_track_prepared(&d->pal,prepared+j,v,d->tick,d->line,d->have_line);
+        else if(d->color) pal_sample(&d->pal,v,d->tick,d->line,d->have_line);
         const PalDecoder *color=d->color?&d->pal:NULL;
         if(d->preview) raster_sample(d->preview,v,v,color);
         /* A separate narrow sync path and hysteresis keep video detail and
@@ -739,11 +740,16 @@ static void process(Decoder *d, const IQ *iq, const IQ *guide,
 
 void decoder_process_video(Decoder *d, const float *video, const float *guide, size_t n)
 {
-    process(d,NULL,NULL,video,guide,n);
+    process(d,NULL,NULL,video,guide,NULL,n);
+}
+void decoder_process_prepared(Decoder *d, const float *video, const float *guide,
+                              const PalComponents *prepared, size_t n)
+{
+    process(d,NULL,NULL,video,guide,prepared,n);
 }
 void decoder_process_guided(Decoder *d, const IQ *iq, const IQ *guide, size_t n)
 {
-    process(d,iq,guide,NULL,NULL,n);
+    process(d,iq,guide,NULL,NULL,NULL,n);
 }
 
 void decoder_process(Decoder *d, const IQ *iq, size_t n)

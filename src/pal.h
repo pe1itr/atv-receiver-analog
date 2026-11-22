@@ -1,6 +1,7 @@
 #ifndef PAL_H
 #define PAL_H
 #include <stdint.h>
+#include <stddef.h>
 /* PAL 4.43 burst-referenced decoder. State belongs to the video DSP thread. */
 typedef struct {
     double rate, step_c, step_s, osc_c, osc_s;
@@ -19,6 +20,10 @@ typedef struct {
     float alpha, u1, u2, v1, v2, y1, y2;
     float notch_b, notch_a, notch_gain, x1, x2, z1, z2;
 } PalDecoder;
+typedef struct { double c,s; float y,u,v; } PalComponents;
+void pal_prepare_block(PalDecoder *filters, const float *video, uint64_t tick, PalComponents *out, size_t n);
+void pal_track_prepared(PalDecoder *p, const PalComponents *sample, float composite,
+                        uint64_t tick, uint64_t line, int have_line);
 void pal_init(PalDecoder *p, double rate);
 void pal_sample(PalDecoder *p, float composite, uint64_t tick, uint64_t line, int have_line);
 uint32_t pal_rgb(const PalDecoder *p);
