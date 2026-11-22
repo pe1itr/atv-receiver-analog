@@ -303,7 +303,12 @@ staan in de [README](README.md).
 ## GitHub-release publiceren
 
 Gebruik `bash scripts/publish-release.sh` met dezelfde tag, bestanden en opties
-als voor `gh release create`. Na publicatie bewaart het script de drie nieuwste
+als voor `gh release create`. De releasecommit hoort op `origin/main`. Na
+publicatie haalt het script de officiële main en tags op, controleert het of de
+nieuwste stabiele release in die geschiedenis zit en werkt het de lokale
+werkmap met `main` bij via fast-forward. Dit werkt ook bij publicatie vanuit
+een aparte releasewerkmap. Bij conflicterend lokaal werk stopt het script vóór
+het opruimen en blijven de wijzigingen bewaard. Na deze controle bewaart het script de drie nieuwste
 gepubliceerde releases op publicatiedatum. Het verwijdert de oudere releases
 met hun downloads en tags. Conceptreleases tellen niet mee.
 
