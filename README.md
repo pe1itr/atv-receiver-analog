@@ -426,7 +426,7 @@ does not compensate for spectral inversion introduced by a converter.
 | `B` / `V` | Shift vertical position by one line in free-running mode |
 | `I` | Invert FM video polarity |
 | `D` | Switch FM0/FM1 demodulation |
-| `O` | Switch between the TV picture and the video oscilloscope |
+| `O` | Cycle TV picture / line scope / vertical sync scope |
 | `F10` | Record a 30-second diagnostic text file; press again to stop early |
 | `Shift+F10` | Copy the saved diagnostic file path |
 | `F9` | Start/stop a raw IQ recording; saves automatically after 3 seconds |
@@ -455,11 +455,13 @@ with **F7**, then press **W** after applying to
 save them for the next start. Empty fields are allowed; locators accept 4, 6, 8
 or 10 characters (for example `JO22AA`).
 
-Press `O` to replace the TV picture with a video oscilloscope, and `O` again
-to return. The trace shows two line periods (about 128 microseconds), including
+Press `O` to cycle through the line scope, vertical sync scope and TV picture.
+The line scope shows two line periods (about 128 microseconds), including
 sync pulses and video content, after video IF filtering, FM demodulation and
 the selected de-emphasis. It uses a sync pulse trigger when possible and runs
-freely otherwise. A pulse trigger does not imply PAL sync lock. Amplitude is
+freely otherwise. A pulse trigger does not imply PAL sync lock. The vertical scope searches a 22 ms acquisition for a broad pulse,
+using approximately 2 microsecond sample averages. It displays 16 lines around
+a matching pulse or the entire acquisition if no pulse triggers. Amplitude is
 automatically scaled in demodulated FM units, not volts. `P` saves the displayed
 scope trace. Reception, audio and picture decoding continue in scope mode.
 

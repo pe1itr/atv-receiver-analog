@@ -162,7 +162,7 @@ typedef struct {
     double if_power_dbfs;
     VideoQualityReading quality;
     uint32_t quality_tick;
-    SDL_atomic_t scope_enabled, scope_epoch;
+    SDL_atomic_t scope_mode, scope_epoch;
     VideoScopeReading scope;
     uint32_t scope_tick;
     IQRecorder *recorder;
@@ -552,7 +552,7 @@ typedef struct {
     uint32_t quality_tick;
     VideoScopeReading scope;
     uint32_t scope_tick;
-    int scope_enabled;
+    int scope_mode;
     int light_stacking;
     IQRecordStatus recording;
     uint32_t pixels[WIDTH*HEIGHT], live[WIDTH*HEIGHT], last_frame, last_stacked;
@@ -591,7 +591,7 @@ static void capture_view(App *a, View *v)
 #define COPY_VIEW(name) v->name=a->name
     COPY_VIEW(quality); COPY_VIEW(quality_tick); COPY_VIEW(clipping);
     COPY_VIEW(scope); COPY_VIEW(scope_tick);
-    v->scope_enabled=SDL_AtomicGet(&a->scope_enabled);
+    v->scope_mode=SDL_AtomicGet(&a->scope_mode);
     v->mono_detect=SDL_AtomicGet(&a->mono_detect);
     v->stereo_detect=SDL_AtomicGet(&a->stereo_detect);
     v->nicam_detect=SDL_AtomicGet(&a->nicam_detect);
@@ -1348,12 +1348,16 @@ static int worker(void *opaque)
         }
         if(ready) {
             uint64_t first_tick=d->tick;
-            if(SDL_AtomicGet(&a->scope_enabled)) {
+            if(SDL_AtomicGet(&a->scope_mode)) {
                 int epoch_now=SDL_AtomicGet(&a->scope_epoch);
-                if(scope_epoch!=epoch_now) { video_scope_reset(&scope,line_hz); scope_epoch=epoch_now; }
+                if(scope_epoch!=epoch_now) {
+                    scope.field=SDL_AtomicGet(&a->scope_mode)==SCOPE_FIELD;
+                    video_scope_reset(&scope,line_hz);
+                    scope_epoch=epoch_now;
+                }
                 if(video_scope_process(&scope,video,ready)) {
                     SDL_LockMutex(a->mutex);
-                    if(SDL_AtomicGet(&a->scope_enabled) && SDL_AtomicGet(&a->scope_epoch)==epoch_now) {
+                    if(SDL_AtomicGet(&a->scope_mode) && SDL_AtomicGet(&a->scope_epoch)==epoch_now) {
                         a->scope=scope.reading; a->scope_tick=SDL_GetTicks();
                     }
                     SDL_UnlockMutex(a->mutex);
@@ -1648,7 +1652,7 @@ static void draw_side_panels(SDL_Renderer *r,const View *v,uint32_t save_notice,
     side_control(r,CONTROL_EXP_SYNC,v->c.experimental_sync?"ON":"OFF",v->c.experimental_sync);
     side_control(r,CONTROL_INVERSE,v->c.invert?"ON":"OFF",v->c.invert);
     side_control(r,CONTROL_DEEMPH,v->c.video_deemphasis?"ON":"OFF",v->c.video_deemphasis);
-    side_control(r,CONTROL_SCOPE,v->scope_enabled?"SCOPE":"TV",v->scope_enabled);
+    side_control(r,CONTROL_SCOPE,v->scope_mode==SCOPE_FIELD?"V SYNC":v->scope_mode?"H SYNC":"TV",v->scope_mode!=SCOPE_TV);
     int stacking=v->stacking || v->light_stacking;
     int light_controls=v->c.rate>10e6 && !v->stacking;
     side_control(r,CONTROL_STACK,v->light_stacking?"6 ON":stacking?"ON":"OFF",stacking);
@@ -1935,7 +1939,10 @@ static void draw_video_scope(SDL_Renderer *r,const View *v)
     const int left=190,top=165,width=620,height=340;
     char label[160];
     SDL_SetRenderDrawColor(r,220,230,240,255);
-    snprintf(label,sizeof(label),"VIDEO OSCILLOSCOPE | O TV | 2 LINES %.1f US",2e6/v->line_hz);
+    int field=v->scope_mode==SCOPE_FIELD;
+    double span_us=s->sequence?s->duration_us:(field?22000:2e6/v->line_hz);
+    snprintf(label,sizeof(label),field?"V SYNC SCOPE | %.2f MS":"H SYNC SCOPE | 2 LINES %.1f US",
+        field?span_us/1000:span_us);
     text(r,140,85,label,2);
     text(r,140,110,v->c.video_deemphasis?
         "SIGNAL: VIDEO IF -> FM -> PAL DE-EMPHASIS":
@@ -1956,10 +1963,10 @@ static void draw_video_scope(SDL_Renderer *r,const View *v)
         int x=left+j*width/8;
         SDL_SetRenderDrawColor(r,45,55,66,255); SDL_RenderDrawLine(r,x,top,x,top+height);
         SDL_SetRenderDrawColor(r,140,155,170,255);
-        snprintf(label,sizeof(label),"%.1f",s->sequence?s->start_us+s->duration_us*j/8:2e6/v->line_hz*j/8);
+        snprintf(label,sizeof(label),field?"%.2f":"%.1f",(s->start_us+span_us*j/8)/(field?1000:1));
         text(r,x-12,top+height+12,label,1);
     }
-    text(r,760,top+height+30,"TIME (US)",1);
+    text(r,760,top+height+30,field?"TIME (MS)":"TIME (US)",1);
     if(s->sequence) {
         if(s->triggered) {
             int x=left+(int)(-s->start_us/s->duration_us*width);
@@ -1978,14 +1985,14 @@ static void draw_video_scope(SDL_Renderer *r,const View *v)
             previous_x=x; previous_y=middle;
         }
         SDL_SetRenderDrawColor(r,220,230,240,255);
-        snprintf(label,sizeof(label),"%s%s",s->triggered?"SYNC PULSE TRIGGER":"FREE RUN - NO SYNC PULSE FOUND",stale?" | STALE":"");
+        snprintf(label,sizeof(label),"%s%s",s->triggered?(field?"BROAD PULSE TRIGGER":"LINE PULSE TRIGGER"):"FREE RUN - NO TRIGGER",stale?" | STALE":"");
         text(r,140,550,label,2);
     } else {
         SDL_SetRenderDrawColor(r,220,230,240,255);
         text(r,240,315,"WAITING FOR VIDEO SAMPLES",2);
     }
     SDL_SetRenderDrawColor(r,140,155,170,255);
-    text(r,140,580,"TRIGGER IS INDEPENDENT OF PAL LOCK | P SAVE SCOPE | O TV",1);
+    text(r,140,580,field?"P SAVE SCOPE | O TV":"P SAVE SCOPE | O V SYNC SCOPE",1);
 }
 
 static void draw_iq_recording(SDL_Renderer *r,const IQRecordStatus *s,const char *warning)
@@ -2033,7 +2040,7 @@ static void draw_info_screen(SDL_Renderer *r, const Config *c)
         {"SHIFT / CTRL", "WHEN TUNING: 1 MHZ / 10 KHZ PER STEP"},
         {"UP / DOWN", "INCREASE / DECREASE RECEIVE GAIN BY 1 DB"},
         {"T", "ENTER FREQUENCY IN MHZ, INCLUDING CONVERTER LO"},
-        {"O", "SWITCH TV PICTURE / VIDEO OSCILLOSCOPE"},
+        {"O", "CYCLE TV / H SYNC SCOPE / V SYNC SCOPE"},
         {"F9 / F10", "IQ RECORDING / DIAGNOSIS TXT (30 SEC); PRESS AGAIN TO STOP"},
         {"SHIFT+F10", "COPY SAVED DIAGNOSIS FILE PATH"},
         {"F7", "EDIT MY CALLSIGN AND LOCATOR"},
@@ -2276,7 +2283,7 @@ static void help(void)
          "Shift+1 (!) = application information and all controls; any key returns.\n"
          "Controls: left/right or wheel = 100 kHz, Shift = 1 MHz, Ctrl = 10 kHz;\n"
          "C = AFC on/off (+/-500 kHz, live SDR); T = type frequency in MHz, Enter = tune, Esc = cancel; up/down = gain 1 dB; I = invert; click spectrum = tune; Q / Esc = quit.\n"
-         "[ / ] = IF narrower/wider by 1 MHz; O = TV / video oscilloscope; F = free sync; , / . = line clock -/+ 0.1 Hz; B/V = vertical position.\n"
+         "[ / ] = IF narrower/wider by 1 MHz; O = TV / H sync scope / V sync scope; F = free sync; , / . = line clock -/+ 0.1 Hz; B/V = vertical position.\n"
          "E = PAL video de-emphasis on/off (default on); G = experimental sync on/off (default off).\n"
          "X = return to SDR setup (restarts reception after configuration).\n"
          "F7 = edit callsign/locator; F10 = start/stop 30-second diagnosis TXT; Shift+F10 = copy saved path.\n"
@@ -2675,7 +2682,7 @@ configure_receiver:
                     }
                 }
                 if(key==SDLK_o) {
-                    SDL_AtomicSet(&a->scope_enabled,!SDL_AtomicGet(&a->scope_enabled));
+                    SDL_AtomicSet(&a->scope_mode,(SDL_AtomicGet(&a->scope_mode)+1)%3);
                     SDL_AtomicAdd(&a->scope_epoch,1);
                     memset(&a->scope,0,sizeof(a->scope)); a->scope_tick=0;
                 }
@@ -2720,17 +2727,17 @@ configure_receiver:
         }
         capture_view(a,view);
         const View *v=view;
-        int screenshot_ready=screenshot_requested==2 || (screenshot_requested && (v->scope_enabled || v->light_stacking));
-        if(screenshot_requested==1 && !v->scope_enabled && !v->light_stacking) {
+        int screenshot_ready=screenshot_requested==2 || (screenshot_requested && (v->scope_mode || v->light_stacking));
+        if(screenshot_requested==1 && !v->scope_mode && !v->light_stacking) {
             if(!exposure) exposure=calloc(1,sizeof(*exposure));
             if(!exposure) {
                 fprintf(stderr,"Screenshot: cannot allocate exposure buffer\n");
                 screenshot_requested=0;
             } else screenshot_ready=screenshot_expose(exposure,v,SDL_GetTicks());
         }
-        int averaged_photo=screenshot_ready && screenshot_requested==1 && !v->scope_enabled && !v->light_stacking;
+        int averaged_photo=screenshot_ready && screenshot_requested==1 && !v->scope_mode && !v->light_stacking;
         const uint32_t *photo=averaged_photo?exposure->pixels:NULL;
-        if(v->scope_enabled) draw_video_scope(r,v);
+        if(v->scope_mode) draw_video_scope(r,v);
         else {
             SDL_UpdateTexture(texture,NULL,photo && !v->stacking?photo:v->pixels,WIDTH*sizeof(uint32_t));
             SDL_Rect video=v->stacking ? (SDL_Rect){10,160,460,345} : (SDL_Rect){120,65,720,540};
@@ -2754,7 +2761,7 @@ configure_receiver:
                 *a->my_call?"  ":"",a->my_call,*a->my_locator?"  ":"",a->my_locator);
             /* Scale 2 uses eight-pixel cells; both video layouts centre at x=480. */
             int caption_x=(960-(int)strlen(buf)*8)/2;
-            text(r,caption_x,v->stacking && !v->scope_enabled?515:612,buf,2);
+            text(r,caption_x,v->stacking && !v->scope_mode?515:612,buf,2);
         }
         snprintf(buf,sizeof(buf),"%.3f MHZ",(v->actual_hz+v->c.lo)/1e6);
         text(r,20,8,buf,6);

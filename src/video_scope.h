@@ -6,6 +6,7 @@
 #define VIDEO_SCOPE_POINTS 640
 /* Three PAL lines, including at the maximum supported 64 MS/s. */
 #define VIDEO_SCOPE_CAPACITY 16384
+enum { SCOPE_TV, SCOPE_LINE, SCOPE_FIELD };
 typedef struct {
     float low[VIDEO_SCOPE_POINTS], high[VIDEO_SCOPE_POINTS];
     float minimum, maximum;
@@ -15,7 +16,9 @@ typedef struct {
 } VideoScopeReading;
 typedef struct {
     float samples[VIDEO_SCOPE_CAPACITY];
-    size_t count, wanted, skip;
+    size_t count, wanted, skip, stride, partial;
+    double partial_sum;
+    int field;
     double rate, line_hz;
     VideoScopeReading reading;
 } VideoScope;
