@@ -50,6 +50,19 @@ int main(void)
     assert(n>0 && (size_t)n<sizeof(diagnostic));
     assert(strstr(diagnostic,"observed losses H=1 V=2 combined=2"));
     assert(strstr(diagnostic,"completed frame gaps >=150 ms=1 max=150 ms"));
+    assert(strstr(diagnostic,"awaiting completed blocks"));
+    a->diagnosis_previous_tick=1;
+    uint64_t freq=SDL_GetPerformanceFrequency();
+    a->timing=(BlockTiming){.blocks=2,.wait_ticks=freq/2,.read_overhead_ticks=freq/50,
+        .processing_ticks=freq/4,.empty_reads=3};
+    n=diagnostic_snapshot(a,diagnostic,sizeof(diagnostic));
+    assert(n>0 && strstr(diagnostic,"2 completed blocks"));
+    assert(strstr(diagnostic,"empty queue wait=250.000"));
+    assert(strstr(diagnostic,"including copy)=10.000"));
+    assert(strstr(diagnostic,"including DSP waits)=125.000"));
+    assert(strstr(diagnostic,"empty reads=3"));
+    diagnostic_snapshot(a,diagnostic,sizeof(diagnostic));
+    assert(strstr(diagnostic,"awaiting completed blocks"));
     /* With flat demodulated video both detectors can explain the absent lock. */
     Decoder *d=calloc(1,sizeof(*d)); assert(d);
     decoder_init(d,5500000,4000000,0,NULL,NULL);

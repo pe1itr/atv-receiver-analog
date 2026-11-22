@@ -104,6 +104,10 @@ typedef struct {
 } StackFrame;
 
 typedef struct {
+    uint64_t blocks, wait_ticks, read_overhead_ticks, processing_ticks, empty_reads;
+} BlockTiming;
+
+typedef struct {
     Config c;
     Decoder *decoder; /* Worker-owned, used in its callback. */
     char my_call[17], my_locator[11]; /* UI-owned station identification. */
@@ -125,6 +129,7 @@ typedef struct {
     uint64_t consumed_samples;
     uint64_t diagnosis_previous_samples;
     uint32_t diagnosis_previous_tick;
+    BlockTiming timing, diagnosis_previous_timing;
     int light_stacking;
     unsigned light_count;
     uint64_t light_input_serial;
@@ -329,6 +334,8 @@ static void afc_toggle(App *a)
 static int diagnostic_snapshot(void *opaque,char *out,size_t capacity)
 {
     App *a=opaque;
+    char pluto[512];
+    source_pluto_diagnostics(a->source,pluto,sizeof(pluto));
     char raw[8192];
     int raw_size=status_json(a,raw,sizeof(raw));
     if(raw_size<=0 || (size_t)raw_size>=sizeof(raw)) return -1;
@@ -336,6 +343,20 @@ static int diagnostic_snapshot(void *opaque,char *out,size_t capacity)
     Uint32 now=SDL_GetTicks(),elapsed=now-a->diagnosis_previous_tick;
     int have_rate=a->diagnosis_previous_tick && elapsed && a->consumed_samples>=a->diagnosis_previous_samples;
     double throughput=have_rate?(a->consumed_samples-a->diagnosis_previous_samples)*1000.0/elapsed/1e6:0;
+    char block_timing[384]="Block timing: awaiting completed blocks in a sampling interval\n";
+    BlockTiming t=a->timing, prev=a->diagnosis_previous_timing;
+    if(a->diagnosis_previous_tick && t.blocks>prev.blocks) {
+        uint64_t blocks=t.blocks-prev.blocks;
+        double scale=1000.0/SDL_GetPerformanceFrequency()/blocks;
+        snprintf(block_timing,sizeof(block_timing),
+            "Receiver thread: %llu completed blocks; mean wall ms/block: empty queue wait=%.3f; "
+            "other input read (including copy)=%.3f; block processing (including DSP waits)=%.3f; "
+            "empty reads=%llu in interval. Pluto RX runs concurrently.\n",
+            (unsigned long long)blocks,(t.wait_ticks-prev.wait_ticks)*scale,
+            (t.read_overhead_ticks-prev.read_overhead_ticks)*scale,(t.processing_ticks-prev.processing_ticks)*scale,
+            (unsigned long long)(t.empty_reads-prev.empty_reads));
+    }
+    a->diagnosis_previous_timing=t;
     a->diagnosis_previous_tick=now; a->diagnosis_previous_samples=a->consumed_samples;
     int fresh=a->last_frame && now-a->last_frame<150;
     int quality_fresh=a->quality_tick && now-a->quality_tick<1000 && !a->info_paused;
@@ -349,7 +370,7 @@ static int diagnostic_snapshot(void *opaque,char *out,size_t capacity)
     int n=snprintf(out,capacity,
         "UTC Unix time: %lld\n"
         "Receiver: %s; paused=%d done=%d failed=%d; metrics age=%u ms\n"
-        "Tuning RF: requested=%.6f MHz actual=%.6f MHz; SDR=%.6f MHz; converter LO=%.6f MHz\n"
+        "%s%sTuning RF: requested=%.6f MHz actual=%.6f MHz; SDR=%.6f MHz; converter LO=%.6f MHz\n"
         "AFC: %s; anchor SDR=%.6f MHz; applied offset=%.3f kHz (not residual error)\n"
         "Rate=%.6f MS/s; RF BW=%.6f MHz; video IF=%.6f MHz; sync IF=%.6f MHz; gain=%.2f dB\n"
         "FM%d/D%d; inversion=%d; PAL de-emphasis=%d; experimental sync=%d; free sync=%d\n"
@@ -362,7 +383,7 @@ static int diagnostic_snapshot(void *opaque,char *out,size_t capacity)
         "Cumulative: discontinuities=%u discarded=%llu hardware overflows=%llu; clipping samples=%llu\n"
         "Raw status (full precision; compare counters and settings between snapshots):\n%s\n",
         (long long)time(NULL),a->c.mode,a->info_paused,SDL_AtomicGet(&a->done),SDL_AtomicGet(&a->failed),
-        a->metrics_tick?now-a->metrics_tick:0,
+        a->metrics_tick?now-a->metrics_tick:0,pluto,block_timing,
         (a->requested_hz+a->c.lo)/1e6,(a->actual_hz+a->c.lo)/1e6,a->actual_hz/1e6,a->c.lo/1e6,
         !a->afc_enabled?"OFF":a->afc_state==1?"TRACK":a->afc_state==2?"LIMIT":"SEEK (no reliable estimate)",
         a->afc_anchor/1e6,(a->actual_hz-a->afc_anchor)/1000,
@@ -1153,10 +1174,12 @@ static int worker(void *opaque)
     uint64_t count = 0, next_fft = 0;
     SpectrumAverage spectrum_average={0};
     uint32_t start = SDL_GetTicks();
+    BlockTiming pending_timing={0};
     Clipping clipping; clipping_init(&clipping,a->c.mode);
     while (!SDL_AtomicGet(&a->stop)) {
         SDL_LockMutex(a->mutex);
         if(a->info_paused) {
+            pending_timing=(BlockTiming){0};
             iq_recorder_finish(a->recorder,"paused");
             uint32_t pause_start=SDL_GetTicks();
             double pause_if=a->if_bandwidth;
@@ -1185,6 +1208,7 @@ static int worker(void *opaque)
         a->command = 0;
         SDL_UnlockMutex(a->mutex);
         if(epoch!=afc_epoch) { afc_reset(&afc,a->c.rate,line_hz); afc_epoch=epoch; }
+        if(command) pending_timing=(BlockTiming){0};
         if(command & 4) {
             finish_video(d,video_path,alignment,&pending);
             reset_audio(&audio,video_path,if_bw);
@@ -1232,9 +1256,14 @@ static int worker(void *opaque)
             if(alignment) alignment_set_fm_mode(alignment,fm_mode,invert);
             reset_audio(&audio,video_path,if_bw);
         }
-        int n = source_read(a->source, iq, a->c.rx_block);
+        uint64_t wait_ticks,read_start=SDL_GetPerformanceCounter();
+        int n=source_read_timed(a->source,iq,a->c.rx_block,&wait_ticks);
+        uint64_t processing_start=SDL_GetPerformanceCounter();
+        pending_timing.wait_ticks+=wait_ticks;
+        pending_timing.read_overhead_ticks+=processing_start-read_start-wait_ticks;
         if(n<=0) finish_video(d,video_path,alignment,&pending);
         if (n == -2 || n == -3) {
+            pending_timing=(BlockTiming){0};
             spectrum_average.valid=0;
             iq_recorder_finish(a->recorder,"input_discontinuity");
             video_quality_reset(&quality); publish_video_quality(a,&quality);
@@ -1262,6 +1291,8 @@ static int worker(void *opaque)
         }
         if (n < 0) goto fail;
         if (!n) {
+            ++pending_timing.empty_reads;
+            pending_timing.processing_ticks+=SDL_GetPerformanceCounter()-processing_start;
             if (!strcmp(a->c.mode, "file")) { audio_idle(&audio,0); nicam_finish(audio.nicam); SDL_AtomicSet(&a->nicam_lock,nicam_locked(audio.nicam)); break; }
             continue;
         }
@@ -1349,6 +1380,17 @@ static int worker(void *opaque)
                 SDL_UnlockMutex(a->mutex);
             }
         }
+        /* Publish matched times only on completed blocks; a 100 ms queue
+         * timeout and its pipeline flush belong to the next delivery. */
+        pending_timing.processing_ticks+=SDL_GetPerformanceCounter()-processing_start;
+        SDL_LockMutex(a->mutex);
+        ++a->timing.blocks;
+        a->timing.wait_ticks+=pending_timing.wait_ticks;
+        a->timing.read_overhead_ticks+=pending_timing.read_overhead_ticks;
+        a->timing.processing_ticks+=pending_timing.processing_ticks;
+        a->timing.empty_reads+=pending_timing.empty_reads;
+        SDL_UnlockMutex(a->mutex);
+        pending_timing=(BlockTiming){0};
         if (!strcmp(a->c.mode, "demo") || !strcmp(a->c.mode, "file")) {
             double ahead = 1000*count/a->c.rate - (SDL_GetTicks()-start);
             if (ahead > 1) SDL_Delay((uint32_t)fmin(ahead, 20));

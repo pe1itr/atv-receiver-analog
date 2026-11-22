@@ -269,6 +269,12 @@ static int hardware_read(void *opaque, IQ *iq, size_t n)
 }
 int source_read(Source *s, IQ *iq, size_t n)
 {
+    uint64_t wait_ticks;
+    return source_read_timed(s,iq,n,&wait_ticks);
+}
+int source_read_timed(Source *s, IQ *iq, size_t n, uint64_t *wait_ticks)
+{
+    *wait_ticks=0;
     if(s->u || s->soapy || s->pluto) {
         if(!s->queue) {
             size_t slots=(size_t)ceil(s->c->rate*.1/n);
@@ -279,7 +285,7 @@ int source_read(Source *s, IQ *iq, size_t n)
             fprintf(stderr,"SDR receive thread: %zu samples/block, %.1f ms IQ buffer\n",
                 n,1000.0*n*slots/s->c->rate);
         }
-        return rx_queue_read(s->queue,iq,n);
+        return rx_queue_read_timed(s->queue,iq,n,wait_ticks);
     }
     if (s->file) {
         size_t got = fread(iq, sizeof(*iq), n, s->file);
@@ -306,6 +312,11 @@ int source_read(Source *s, IQ *iq, size_t n)
         }
     }
     return (int)n;
+}
+void source_pluto_diagnostics(Source *s, char *out, size_t capacity)
+{
+    if(s && s->pluto) pluto_source_diagnostics(s->pluto,out,capacity);
+    else if(capacity) out[0]=0;
 }
 void source_get_stats(Source *s, SourceStats *stats)
 {

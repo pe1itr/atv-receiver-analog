@@ -101,10 +101,18 @@ fail:
 }
 int rx_queue_read(RxQueue *q, IQ *iq, size_t capacity)
 {
+    uint64_t wait_ticks;
+    return rx_queue_read_timed(q,iq,capacity,&wait_ticks);
+}
+int rx_queue_read_timed(RxQueue *q, IQ *iq, size_t capacity, uint64_t *wait_ticks)
+{
+    *wait_ticks=0;
     if(!capacity) return 0;
     SDL_LockMutex(q->mutex);
     while(!q->count && !q->gap && !q->failed && !q->stop) {
+        uint64_t start=SDL_GetPerformanceCounter();
         int result=SDL_CondWaitTimeout(q->changed,q->mutex,100);
+        *wait_ticks+=SDL_GetPerformanceCounter()-start;
         if(result) { SDL_UnlockMutex(q->mutex); return result==SDL_MUTEX_TIMEDOUT?0:-1; }
     }
     int result=0;

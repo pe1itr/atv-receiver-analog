@@ -6,6 +6,7 @@
 #include <errno.h>
 #ifdef HAVE_LIBIIO
 #include <iio.h>
+#include <SDL_atomic.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -42,6 +43,9 @@ struct PlutoSource {
     float scale_i, scale_q;
     int native_format;
     SampleFormat format_i, format_q;
+    char library_info[160];
+    SDL_SpinLock timing_lock;
+    uint64_t refill_calls, timeouts, would_block;
     uint64_t read_blocks, read_samples;
     double refill_seconds, conversion_seconds;
 };
@@ -104,6 +108,13 @@ PlutoSource *pluto_source_open(Config *c)
     if(!s) return NULL;
     s->ctx=open_context(c->pluto_uri);
     if(!s->ctx) { fprintf(stderr,"Pluto: cannot open AD9361; check USB or --pluto-uri\n"); goto fail; }
+    unsigned major,minor;
+    char tag[8],backend_version[48]="unavailable";
+    if(iio_context_get_version(s->ctx,&major,&minor,tag)==0)
+        snprintf(backend_version,sizeof(backend_version),"%u.%u %.8s",major,minor,tag);
+    iio_library_get_version(&major,&minor,tag);
+    snprintf(s->library_info,sizeof(s->library_info),"libiio %u.%u %.8s; backend %s; backend version %s",
+        major,minor,tag,iio_context_get_name(s->ctx),backend_version);
     CHECK(iio_context_set_timeout(s->ctx,1000));
     struct iio_device *phy=iio_context_find_device(s->ctx,"ad9361-phy");
     s->rx=iio_context_find_device(s->ctx,"cf-ad9361-lpc");
@@ -163,7 +174,12 @@ int pluto_source_read(PlutoSource *s, IQ *iq, size_t n)
     double before=monotonic_seconds();
     ssize_t bytes=iio_buffer_refill(s->buffer);
     double received=monotonic_seconds();
+    SDL_AtomicLock(&s->timing_lock);
+    ++s->refill_calls;
     s->refill_seconds+=received-before;
+    if(bytes==-ETIMEDOUT) ++s->timeouts;
+    if(bytes==-EAGAIN) ++s->would_block;
+    SDL_AtomicUnlock(&s->timing_lock);
     if(bytes==-ETIMEDOUT || bytes==-EAGAIN) return 0;
     if(bytes==-EOVERFLOW) return -2;
     if(bytes<0) { fprintf(stderr,"Pluto RX: %s\n",strerror((int)-bytes)); return -1; }
@@ -182,9 +198,25 @@ int pluto_source_read(PlutoSource *s, IQ *iq, size_t n)
         else { vi=(int16_t)unpack_sample(pi+k*step,&s->format_i); vq=(int16_t)unpack_sample(pq+k*step,&s->format_q); }
         iq[k]=(IQ){vi*s->scale_i,vq*s->scale_q};
     }
+    double conversion=monotonic_seconds()-received;
+    SDL_AtomicLock(&s->timing_lock);
     ++s->read_blocks; s->read_samples+=count;
-    s->conversion_seconds+=monotonic_seconds()-received;
+    s->conversion_seconds+=conversion;
+    SDL_AtomicUnlock(&s->timing_lock);
     return (int)count;
+}
+void pluto_source_diagnostics(PlutoSource *s, char *out, size_t capacity)
+{
+    SDL_AtomicLock(&s->timing_lock);
+    uint64_t calls=s->refill_calls,blocks=s->read_blocks,samples=s->read_samples;
+    uint64_t timeouts=s->timeouts,again=s->would_block;
+    double refill=s->refill_seconds,conversion=s->conversion_seconds;
+    SDL_AtomicUnlock(&s->timing_lock);
+    snprintf(out,capacity,"Pluto: %s\n"
+        "Pluto RX totals since open: refill calls=%llu time=%.3f ms; timeouts=%llu would-block=%llu; "
+        "converted blocks=%llu samples=%llu conversion time=%.3f ms\n",
+        s->library_info,(unsigned long long)calls,1000*refill,(unsigned long long)timeouts,
+        (unsigned long long)again,(unsigned long long)blocks,(unsigned long long)samples,1000*conversion);
 }
 void pluto_source_close(PlutoSource *s)
 {
@@ -200,6 +232,8 @@ void pluto_source_close(PlutoSource *s)
     free(s);
 }
 #else
+void pluto_source_diagnostics(PlutoSource *s, char *out, size_t capacity)
+{ (void)s; if(capacity) out[0]=0; }
 PlutoSource *pluto_source_open(Config *c)
 {
     (void)c; fprintf(stderr,"Pluto: this build needs libiio >= 0.23 and < 1.0 (libiio-dev); rebuild with make -B\n"); return NULL;

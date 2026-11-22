@@ -9,6 +9,7 @@ typedef int (*RxControlFn)(void *);
  * sends controls (or executes a live control on its own thread).
  * read: samples, 0 timeout, -2 discontinuity, other negative fatal error. */
 RxQueue *rx_queue_create(size_t block, size_t slots, RxReadFn read, void *opaque);
+int rx_queue_read_timed(RxQueue *q, IQ *iq, size_t capacity, uint64_t *wait_ticks);
 int rx_queue_read(RxQueue *q, IQ *iq, size_t capacity);
 int rx_queue_control(RxQueue *q, RxControlFn fn, void *opaque);
 /* Runs control on the sole consumer's thread while the producer keeps

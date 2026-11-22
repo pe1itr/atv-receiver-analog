@@ -33,11 +33,13 @@ typedef struct {
     uint64_t discarded_samples, hardware_overflows;
 } SourceStats;
 Source *source_open(Config *c);
+int source_read_timed(Source *s, IQ *iq, size_t n, uint64_t *wait_ticks);
 int source_read(Source *s, IQ *iq, size_t n); /* -3 file loop, -2 discontinuity, -1 error, 0 timeout/EOF */
 int source_tune(Source *s, double *hz, double *gain);
 void source_stop(Source *s);
 /* Stop hardware and discard queued IQ; next read restarts reception. */
 void source_pause(Source *s);
+void source_pluto_diagnostics(Source *s, char *out, size_t capacity);
 void source_get_stats(Source *s, SourceStats *stats);
 void source_close(Source *s);
 typedef struct IFFilter IFFilter;
