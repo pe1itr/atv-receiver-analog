@@ -860,13 +860,14 @@ static void frame(void *opaque, const uint32_t *pixels)
     SDL_UnlockMutex(a->mutex);
 }
 static void init_decoders(App *a, Decoder *d, Decoder *preview,
-                          int invert, int free_sync, double line_hz, int vertical_shift, double if_bw, int deemphasis, int experimental_sync)
+                          int invert, int free_sync, double line_hz, int vertical_shift, double if_bw, int deemphasis, int experimental_sync, int fm_mode)
 {
     decoder_init(d,a->c.rate,a->c.deviation,invert,frame,a);
     /* Both display modes use the adaptive sync clock, which keeps producing
      * rasters while searching/coasting. F only selects the independent live
      * preview versus the sync-following raster, not the legacy pulse gate. */
     d->experimental_sync=experimental_sync;
+    d->multi_candidate_sync=fm_mode==2;
     d->free_sync=1; d->line_hz=line_hz; d->vertical_shift=vertical_shift;
     if(a->c.alignment_bandwidth>0)
         d->guide_stride=(unsigned)fmax(1,floor(a->c.rate/fmax(4e6,2*a->c.alignment_bandwidth)));
@@ -1137,7 +1138,7 @@ static int worker(void *opaque)
     SDL_LockMutex(a->mutex);
     int initial_vertical_shift=a->vertical_shift;
     SDL_UnlockMutex(a->mutex);
-    init_decoders(a,d,preview,a->c.invert,a->c.free_sync,a->c.line_hz,initial_vertical_shift,a->c.if_bandwidth,a->c.video_deemphasis,a->c.experimental_sync);
+    init_decoders(a,d,preview,a->c.invert,a->c.free_sync,a->c.line_hz,initial_vertical_shift,a->c.if_bandwidth,a->c.video_deemphasis,a->c.experimental_sync,a->c.fm_mode);
     a->decoder=d;
     if(d->color && a->c.rx_block>PAL_CHUNK && !(pal=pal_pipeline_create())) goto fail;
     video_path=alignment_create_video(a->c.rate,a->c.if_bandwidth,a->c.deviation,a->c.invert,a->c.rx_block,d->color);
@@ -1167,7 +1168,7 @@ static int worker(void *opaque)
     }
     alignment_set_fm_mode(video_path,a->c.fm_mode,a->c.invert);
     if(alignment) alignment_set_fm_mode(alignment,a->c.fm_mode,a->c.invert);
-    fprintf(stderr,"FM%d detector: video and alignment; D switches FM0/FM1\n",a->c.fm_mode);
+    fprintf(stderr,"FM%d detector: video and alignment; D cycles FM0/FM1/FM2\n",a->c.fm_mode);
     AFC afc; afc_reset(&afc,a->c.rate,a->c.line_hz);
     unsigned afc_epoch=0;
     double applied_if = a->c.if_bandwidth;
@@ -1240,7 +1241,7 @@ static int worker(void *opaque)
             publish_video_quality(a,&quality);
             video_scope_reset(&scope,line_hz);
             SDL_LockMutex(a->mutex); memset(&a->scope,0,sizeof(a->scope)); a->scope_tick=0; SDL_UnlockMutex(a->mutex);
-            init_decoders(a,d,preview,invert,free_sync,line_hz,vertical_shift,if_bw,deemphasis,experimental_sync);
+            init_decoders(a,d,preview,invert,free_sync,line_hz,vertical_shift,if_bw,deemphasis,experimental_sync,fm_mode);
             if(d->color && a->c.rx_block>PAL_CHUNK && !pal && !(pal=pal_pipeline_create())) goto fail;
             if(alignment) alignment_reset(alignment,invert);
             if (if_bw != applied_if || deemphasis != applied_deemphasis) {
@@ -1283,7 +1284,7 @@ static int worker(void *opaque)
             a->afc_state=0;
             a->last_frame = 0; interrupt_stack(a);
             SDL_UnlockMutex(a->mutex);
-            init_decoders(a,d,preview,invert,free_sync,line_hz,vertical_shift,if_bw,deemphasis,experimental_sync);
+            init_decoders(a,d,preview,invert,free_sync,line_hz,vertical_shift,if_bw,deemphasis,experimental_sync,fm_mode);
             afc_reset(&afc,a->c.rate,line_hz);
             alignment_reset(video_path,invert);
             reset_audio(&audio,video_path,if_bw);
@@ -1649,7 +1650,7 @@ static void draw_side_panels(SDL_Renderer *r,const View *v,uint32_t save_notice,
         afc=label;
     }
     side_control(r,CONTROL_AFC,afc,!can_afc?3:v->afc_enabled);
-    side_control(r,CONTROL_FM,v->fm_mode?"FM1":"FM0",0);
+    side_control(r,CONTROL_FM,v->fm_mode==2?"FM2":v->fm_mode?"FM1":"FM0",0);
     side_control(r,CONTROL_FREE_SYNC,v->free_sync?"ON":"OFF",v->free_sync);
     side_control(r,CONTROL_EXP_SYNC,v->c.experimental_sync?"ON":"OFF",v->c.experimental_sync);
     side_control(r,CONTROL_INVERSE,v->c.invert?"ON":"OFF",v->c.invert);
@@ -2053,7 +2054,7 @@ static void draw_info_screen(SDL_Renderer *r, const Config *c)
         {"W / X", "SAVE SETTINGS AND SDR PROFILE / RETURN TO SETUP"},
         {"C", "AFC ON / OFF: TRACK SIGNAL WITHIN +/-500 KHZ (LIVE SDR)"},
         {"I", "INVERT FM VIDEO POLARITY"},
-        {"D / E", "SWITCH FM0 / FM1; PAL VIDEO DE-EMPHASIS ON / OFF"},
+        {"D / E", "FM0 / FM1 / FM2; PAL DE-EMPHASIS ON / OFF"},
         {"F / G", "FREE SYNC / EXPERIMENTAL ECHO-RESISTANT SYNC ON / OFF"},
         {"[ / ]", "DECREASE / INCREASE VIDEO IF BANDWIDTH BY 1 MHZ"},
         {", / .", "DECREASE / INCREASE LINE FREQUENCY BY 0.1 HZ"},
@@ -2275,7 +2276,7 @@ static void help(void)
          "  --no-status-server     disable status API, including a saved setting\n"
          "  --status-bind IPV4     local bind address (default 127.0.0.1; LAN: 0.0.0.0)\n"
          "  --status-port PORT     TCP port (default 8765); GET /status\n"
-         "  --fm-mode 0|1          FM detector for video and alignment (default 0); D toggles\n"
+         "  --fm-mode 0|1|2        FM detector (2: FM1 with multi-candidate PAL sync); D cycles\n"
          "  --invert               reverse FM video polarity\n"
          "  --snapshot PATH        save UI screenshot as BMP on exit\n"
          "  --record PATH          capture raw IQ in RAM, save native cf32 on exit (no overwrite)\n"
@@ -2427,7 +2428,7 @@ static int atv_main(int argc, char **argv)
         else if (!strcmp(o,"--alignment-bandwidth")) a->c.alignment_bandwidth=number(v);
         else if (!strcmp(o,"--line-hz")) a->c.line_hz=number(v);
         else if (!strcmp(o,"--fm-mode")) {
-            if(strcmp(v,"0") && strcmp(v,"1")) { fprintf(stderr,"--fm-mode requires 0 or 1\n"); free(a); return 2; }
+            if(strcmp(v,"0") && strcmp(v,"1") && strcmp(v,"2")) { fprintf(stderr,"--fm-mode requires 0, 1 or 2\n"); free(a); return 2; }
             a->c.fm_mode=atoi(v);
         }
         else if (!strcmp(o,"--hackrf-amp")) {
@@ -2649,7 +2650,7 @@ configure_receiver:
                     a->command|=4;
                 }
                 if(key==SDLK_a && !e.key.repeat) SDL_AtomicSet(&a->audio_muted,!SDL_AtomicGet(&a->audio_muted));
-                if(key==SDLK_d && !e.key.repeat) { a->fm_mode^=1; a->command|=2; }
+                if(key==SDLK_d && !e.key.repeat) { a->fm_mode=(a->fm_mode+1)%3; a->command|=2; }
                 if(key==SDLK_e && !e.key.repeat) { a->video_deemphasis^=1; a->command|=2; }
                 if(key==SDLK_g && !e.key.repeat) { a->experimental_sync^=1; a->command|=2; }
                 if(key==SDLK_f) { a->free_sync=!a->free_sync; a->command|=2; }

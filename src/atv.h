@@ -71,6 +71,12 @@ typedef struct {
     uint64_t v_scans, v_candidates, v_timing_resets, v_confirmations;
 } SyncEvidence;
 
+typedef struct {
+    uint64_t onset;
+    double score;
+    unsigned fields;
+} VerticalPulse;
+
 typedef struct Decoder {
     SyncEvidence sync_evidence;
     double rate, deviation, line_hz;
@@ -96,16 +102,20 @@ typedef struct Decoder {
     unsigned hsync_confirmations;
     double hsync_sum[3][128];
     double fold_period, fold_phase;
-    uint64_t fold_tick, vsync_bin_samples;
+    double fold_tick;
+    unsigned vsync_bin_samples;
     unsigned hsync_samples[3][128];
     double vsync_bins[64], vsync_sum, vsync_best, vsync_period;
     double vsync_times[8];
-    uint64_t vsync_bin_tick, vsync_peak, vsync_last, vsync_event, vsync_confirmed;
+    uint64_t vsync_peak, vsync_last, vsync_event, vsync_confirmed;
     unsigned vsync_samples, vsync_pos, vsync_filled, vsync_count;
     unsigned vsync_updates, vsync_epoch;
     /* Full-field candidate selection, independent of raster phase. */
     uint64_t vsync_scan_tick, vsync_scan_peak;
     double vsync_scan_best;
+    int multi_candidate_sync;
+    VerticalPulse field_pulses[4], previous_pulses[4];
+    unsigned field_pulse_count, previous_pulse_count;
     int vsync_scan_depth_seen, vsync_scan_contrast_seen;
     uint32_t pixels[WIDTH * HEIGHT];
     uint32_t guide_pixels[WIDTH * HEIGHT];

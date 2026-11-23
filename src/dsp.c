@@ -254,6 +254,44 @@ static void vertical_candidate(Decoder *d, uint64_t onset)
     d->sync_evidence.v_result="confirmed";
 }
 
+/* Retain only the strongest separated groups within a scan. Match measured
+ * onsets across adjacent scans; coasting alone cannot create a candidate. */
+static void retain_vertical_pulse(Decoder *d)
+{
+    unsigned slot=d->field_pulse_count;
+    if(slot<4) ++d->field_pulse_count;
+    else {
+        slot=0;
+        for(unsigned i=1;i<4;++i)
+            if(d->field_pulses[i].score<d->field_pulses[slot].score) slot=i;
+        if(d->vsync_best<=d->field_pulses[slot].score) return;
+    }
+    d->field_pulses[slot]=(VerticalPulse){d->vsync_peak,d->vsync_best,1};
+}
+
+static void select_repeating_pulse(Decoder *d, double period)
+{
+    VerticalPulse best={0};
+    for(unsigned i=0;i<d->field_pulse_count;++i) {
+        VerticalPulse *pulse=&d->field_pulses[i];
+        for(unsigned j=0;j<d->previous_pulse_count;++j) {
+            const VerticalPulse *previous=&d->previous_pulses[j];
+            double interval=(double)pulse->onset-previous->onset;
+            if(fabs(interval-period)<d->rate*80e-6) {
+                unsigned fields=previous->fields<3?previous->fields+1:3;
+                if(fields>pulse->fields) pulse->fields=fields;
+            }
+        }
+        if(pulse->fields>best.fields || (pulse->fields==best.fields && pulse->score>best.score))
+            best=*pulse;
+    }
+    memcpy(d->previous_pulses,d->field_pulses,d->field_pulse_count*sizeof(VerticalPulse));
+    d->previous_pulse_count=d->field_pulse_count;
+    d->field_pulse_count=0;
+    d->vsync_scan_peak=best.onset;
+    d->vsync_scan_best=best.score;
+}
+
 /* Average the broad PAL sync group before thresholding, so fragmented pulses
  * can still establish field timing. Compare 160 us with both surrounding
  * porches; horizontal sync alone cannot satisfy this long negative trough. */
@@ -266,6 +304,7 @@ static void vertical_sample(Decoder *d, float v)
          * let that first candidate suppress the rest of the field. Keep the
          * three-field timing confirmation in vertical_candidate afterwards. */
         ++d->sync_evidence.v_scans;
+        if(d->multi_candidate_sync) select_repeating_pulse(d,period);
         if(d->vsync_scan_best) vertical_candidate(d,d->vsync_scan_peak);
         else if(!d->vsync_scan_depth_seen) d->sync_evidence.v_result="broad_pulse_too_shallow";
         else if(!d->vsync_scan_contrast_seen) d->sync_evidence.v_result="broad_pulse_low_contrast";
@@ -275,8 +314,7 @@ static void vertical_sample(Decoder *d, float v)
         d->vsync_scan_best=0;
     }
     d->vsync_sum+=sync_clip(v); ++d->vsync_samples;
-    if(d->tick-d->vsync_bin_tick<d->vsync_bin_samples) return;
-    d->vsync_bin_tick=d->tick;
+    if(d->vsync_samples<d->vsync_bin_samples) return;
     d->vsync_bins[d->vsync_pos]=d->vsync_sum/d->vsync_samples;
     d->vsync_pos=(d->vsync_pos+1)%64;
     d->vsync_sum=0; d->vsync_samples=0;
@@ -304,7 +342,8 @@ static void vertical_sample(Decoder *d, float v)
         }
     }
     if(d->vsync_best && d->tick-d->vsync_peak>d->rate*400e-6) {
-        if(d->vsync_best>d->vsync_scan_best) {
+        if(d->multi_candidate_sync) retain_vertical_pulse(d);
+        else if(d->vsync_best>d->vsync_scan_best) {
             d->vsync_scan_best=d->vsync_best;
             d->vsync_scan_peak=d->vsync_peak;
         }
@@ -605,18 +644,20 @@ static void process(Decoder *d, const IQ *iq, const IQ *guide,
 {
     d->guided=(guide!=NULL || guide_video!=NULL) && !d->no_guide_raster;
     d->nominal_line_period=d->rate/d->line_hz;
-    d->vsync_bin_samples=(uint64_t)llround(d->rate*8e-6);
+    const double sync_rate=fmin(4e6,d->rate);
+    const double sync_step=d->rate/sync_rate;
+    d->vsync_bin_samples=(unsigned)fmax(1,round(sync_rate*8e-6));
     if(d->preview) d->preview->nominal_line_period=d->preview->rate/d->preview->line_hz;
     const float scale = d->rate / (2 * PI * d->deviation) * (d->invert ? -1 : 1);
     const float alpha = 1 - exp(-2 * PI * 2500000 / d->rate);
     const unsigned guide_stride=d->guide_stride?d->guide_stride:1;
     const float guide_alpha=1-exp(-2*PI*2500000*guide_stride/d->rate);
     const float sync_alpha = 1 - exp(-2 * PI * 500000 / d->rate);
-    const unsigned sync_stride=(unsigned)fmax(1,floor(d->rate/4e6));
-    /* Keep the same absolute sample grid across arbitrary block boundaries
-     * without an integer division for every input sample. */
-    uint64_t first_sync=d->tick+(!d->previous_valid?1:0);
-    uint64_t next_sync=first_sync+(sync_stride-first_sync%sync_stride)%sync_stride;
+    /* Anchor the 4 MHz timing grid to the stream, including blocks that
+     * start between two grid points. Tick zero primes the discriminator. */
+    uint64_t sync_index=d->tick>1 ? (uint64_t)((d->tick-1)/sync_step) : 1;
+    double sync_tick=sync_index*sync_step;
+    while(d->tick && sync_tick<=(double)(d->tick-1)) sync_tick=++sync_index*sync_step;
     for (size_t j = 0; j < n; ++j, ++d->tick) {
         float v,gv;
         if(video) {
@@ -661,27 +702,30 @@ static void process(Decoder *d, const IQ *iq, const IQ *guide,
         if(d->preview) raster_sample(d->preview,v,v,color);
         /* A separate narrow sync path and hysteresis keep video detail and
          * high-frequency noise from repeatedly triggering the sync detector. */
+        float previous_sync=d->sync_filtered;
         d->sync_filtered += sync_alpha * (gv - d->sync_filtered);
-        if(d->free_sync && d->tick==next_sync) {
-            next_sync+=sync_stride;
-            vertical_sample(d,d->sync_filtered);
+        if(d->free_sync && d->tick>=sync_tick) {
+            float fraction_back=(float)(d->tick-sync_tick);
+            float sample=d->sync_filtered+fraction_back*(previous_sync-d->sync_filtered);
+            vertical_sample(d,sample);
             double period=d->free_period ? d->free_period : d->rate/d->line_hz;
             /* Advance the folding phase on its sample clock; fmod is only
              * needed when sync changes the recovered period. */
             if(period!=d->fold_period) {
                 d->fold_period=period;
-                d->fold_phase=fmod(d->tick,period);
+                d->fold_phase=fmod(sync_tick,period);
             } else {
-                d->fold_phase+=d->tick-d->fold_tick;
+                d->fold_phase+=sync_tick-d->fold_tick;
                 if(d->fold_phase>=period) d->fold_phase-=period;
             }
-            d->fold_tick=d->tick;
+            d->fold_tick=sync_tick;
+            sync_tick=++sync_index*sync_step;
             int bin=(int)(d->fold_phase*128/period)%128;
             double field_age=((double)d->tick-(double)d->field)/d->rate;
             if(field_age>=0 && field_age<.020) {
                 int part=(int)(field_age*150);
                 if(part<3) {
-                    d->hsync_sum[part][bin]+=sync_clip(d->sync_filtered);
+                    d->hsync_sum[part][bin]+=sync_clip(sample);
                     ++d->hsync_samples[part][bin];
                 }
             }

@@ -425,7 +425,7 @@ does not compensate for spectral inversion introduced by a converter.
 | `,` / `.` | Adjust free-running line frequency by 0.1 Hz |
 | `B` / `V` | Shift vertical position by one line in free-running mode |
 | `I` | Invert FM video polarity |
-| `D` | Switch FM0/FM1 demodulation |
+| `D` | Cycle FM0 / FM1 / FM2 |
 | `O` | Toggle TV picture / scope. PgDn and PgUp decrease and increase time per division |
 | `F10` | Record a 30-second diagnostic text file; press again to stop early |
 | `Shift+F10` | Copy the saved diagnostic file path |
@@ -480,15 +480,22 @@ Manual tuning moves the anchor. Disabling AFC keeps the last tuned frequency;
 **FM0** is the conventional phase discriminator and the starting point for
 color and detail. **FM1** uses an 8-point FFT phase detector and may help weak
 signals with a narrow IF, but can affect detail, color and audio and costs
-more CPU. **D** changes both the video and alignment paths and resets their
+more CPU. **FM2** uses the FM1 detector and compares up to four broad-sync
+pulse groups per field with candidates from the previous field. It favours
+repeating PAL timing when a stronger, intermittent pulse competes with sync.
+**D** changes both the video and alignment paths and resets their
 history and stack. Compare at the same frequency and bandwidth; there is no
 universally optimal mode.
 
 ## Weak-signal reception and stacking
 
+The vertical detector and folded horizontal detector sample the filtered sync
+signal every 0.25 µs at all supported SDR rates. The decoder interpolates
+between input samples when necessary. Individual horizontal pulse edges are
+timed at the native input rate.
+
 Vertical synchronization compares broad-sync candidates over a complete field
-before selecting the strongest one, then requires consistent timing across
-three fields. This prevents an earlier dark picture feature from hiding the
+and checks for consistent timing across three fields. This prevents an earlier dark picture feature from hiding the
 real sync pulse and producing a stationary picture at the wrong vertical position.
 
 Fixed stacking averages accepted, aligned field pictures to reduce noise. With

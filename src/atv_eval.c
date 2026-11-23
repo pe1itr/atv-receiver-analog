@@ -41,8 +41,9 @@ int main(int argc,char **argv)
         const char *o=argv[j];
         if(!strcmp(o,"--help")) {
             puts("atv-eval --file IQ [--rate SPS] [--deviation HZ] [--if-bandwidth HZ]\n"
-                 "         [--free-sync] [--line-hz HZ] [--invert] [--fm-mode 0|1] [--alignment-bandwidth HZ]\n"
+                 "         [--free-sync] [--line-hz HZ] [--invert] [--fm-mode 0|1|2] [--alignment-bandwidth HZ]\n"
                  "         [--reference clean.pgm] [--output last-field.pgm]\n"
+                 "Use --free-sync to evaluate adaptive PAL timing, including FM2.\n"
                  "Outputs JSON metrics. Reference is a 640x288 8-bit P5 PGM written by this tool.\n"
                  "No fields = null image metrics, no output image; process still succeeds."); return 0;
         }
@@ -58,7 +59,7 @@ int main(int argc,char **argv)
         else if(!strcmp(o,"--if-bandwidth")) bw=number(v);
         else if(!strcmp(o,"--alignment-bandwidth")) alignment_bw=number(v);
         else if(!strcmp(o,"--fm-mode")) {
-            if(strcmp(v,"0") && strcmp(v,"1")) { fprintf(stderr,"Invalid FM mode\n"); return 2; }
+            if(strcmp(v,"0") && strcmp(v,"1") && strcmp(v,"2")) { fprintf(stderr,"Invalid FM mode\n"); return 2; }
             fm_mode=atoi(v);
         }
         else if(!strcmp(o,"--line-hz")) line_hz=number(v);
@@ -92,7 +93,7 @@ int main(int argc,char **argv)
         m->have_reference=1;
     }
     in=fopen(path,"rb"); if(!in) { perror(path); goto done; }
-    decoder_init(d,rate,deviation,invert,frame,m); d->free_sync=free_sync; d->line_hz=line_hz;
+    decoder_init(d,rate,deviation,invert,frame,m); d->free_sync=free_sync; d->multi_candidate_sync=fm_mode==2; d->line_hz=line_hz;
     uint64_t samples=0;
     for(;;) {
         size_t bytes=fread(iq,1,BLOCK*sizeof(*iq),in);

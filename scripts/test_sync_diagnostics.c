@@ -8,8 +8,75 @@ static void observed(App *a,uint32_t now,int h,int v)
     sync_diagnostics_frame(a,now,h,v);
     a->last_frame=now;
 }
+/* Alternating stronger interference hides the genuine group from a
+ * strongest-only detector. Its phase changes by milliseconds every field. */
+static void test_competing_vertical_groups(void)
+{
+    const int samples=80000;
+    float video[80000];
+    Decoder *d=malloc(sizeof(*d));
+    assert(d);
+    for(int mode=1;mode<=2;++mode) {
+        decoder_init(d,4e6,4e6,0,NULL,NULL);
+        d->free_sync=1;
+        d->multi_candidate_sync=mode==2;
+        for(int field=0;field<24;++field) {
+            int interference=8000+16000*(field%3);
+            memset(video,0,sizeof(video));
+            for(int j=0;j<640;++j) {
+                video[interference+j]=-.35f;
+                if(field<16) video[56000+j]=-.15f;
+            }
+            decoder_process_video(d,video,NULL,samples);
+            if(field==15) {
+                if(mode==1) assert(d->vsync_updates==0);
+                else {
+                    assert(d->vsync_updates>=10);
+                    assert(fabs(remainder((double)d->vsync_confirmed-56000,samples))<64);
+                }
+            }
+        }
+        if(mode==2) assert(d->tick-d->vsync_confirmed>6u*samples);
+    }
+    free(d);
+}
+
+/* Same continuous PAL timing at each input rate. Odd block lengths split
+ * interpolation pairs. Check the grid and 8 us bin phase at every split. */
+static void test_sync_sample_grid(void)
+{
+    const unsigned rates[]={10000000,20000000,9375000};
+    float video[997];
+    Decoder *d=malloc(sizeof(*d)); assert(d);
+    for(unsigned k=0;k<sizeof(rates)/sizeof(*rates);++k) {
+        unsigned rate=rates[k];
+        decoder_init(d,rate,4e6,0,NULL,NULL);
+        d->free_sync=1;
+        uint64_t end=rate/5;
+        while(d->tick<end) {
+            size_t n=end-d->tick<997?(size_t)(end-d->tick):997;
+            for(size_t j=0;j<n;++j) {
+                double t=(d->tick+j)/(double)rate;
+                double field=fmod(t,.020);
+                video[j]=(field>=.005 && field<.005160) || fmod(t,64e-6)<4.7e-6 ? -.30f : 0;
+            }
+            decoder_process_video(d,video,NULL,n);
+            uint64_t points=(d->tick-1)*4000000/rate;
+            assert(fabs(d->fold_tick-points*(rate/4e6))<1e-6);
+            assert(d->vsync_samples==points%32);
+        }
+        assert(d->vsync_updates>=5 && d->hsync_updates>=5);
+        assert(fabs(remainder(d->vsync_confirmed/(double)rate-.005,.020))<16e-6);
+        printf("PAL grid %.3f MS/s: H %u, V %u, %.4f Hz\n",
+               rate/1e6,d->hsync_updates,d->vsync_updates,rate/d->vsync_period);
+    }
+    free(d);
+}
+
 int main(void)
 {
+    test_sync_sample_grid();
+    test_competing_vertical_groups();
     assert(SDL_Init(SDL_INIT_TIMER)==0);
     App *a=calloc(1,sizeof(*a)); assert(a);
     a->mutex=SDL_CreateMutex(); assert(a->mutex);
