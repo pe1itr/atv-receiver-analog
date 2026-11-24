@@ -62,6 +62,19 @@ int main(void)
     capture_view(a,v);
     assert(v->pixels[0]==0xff345678);
     free(v);
+    /* At 20 MS/s a brief loss of V sync must preserve the six-picture RGB average. */
+    a->c.rate=20e6;
+    decoder_init(d,20e6,4e6,0,NULL,NULL); d->free_sync=1;
+    SDL_LockMutex(a->mutex); stack_action(a,1); SDL_UnlockMutex(a->mutex);
+    d->hsync_updates=d->vsync_updates=d->vsync_epoch=1;
+    for(int k=0;k<LIGHT_STACK_FRAMES;++k) feed(a,0xffff0000);
+    assert(a->sync_locked && a->light_count==6);
+    d->tick+=4000000;
+    feed(a,0xff0000ff);
+    assert(!a->sync_locked && a->light_count==6 && a->pixels[0]==0xffd5002b);
+    d->vsync_confirmed=d->tick; ++d->vsync_epoch;
+    feed(a,0xff0000ff);
+    assert(a->sync_locked && a->light_count==6 && a->pixels[0]==0xffaa0055);
     SDL_AtomicSet(&a->stop,1); SDL_CondBroadcast(a->stack_ready); SDL_WaitThread(thread,NULL);
     SDL_DestroyCond(a->stack_ready); SDL_DestroyMutex(a->mutex); free(d); free(a); SDL_Quit();
     puts("Live rolling: five-picture RGB eviction, no frame gating, preview once, pause, resize and fixed/rolling switch OK");

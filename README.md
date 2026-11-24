@@ -517,7 +517,8 @@ video. This keeps RGB colour and the full TV area, without the separate live
 pane or image-registration work. The first five pictures warm up the window;
 it then continuously replaces the oldest picture. Motion can soften slightly.
 The bounded background worker never makes live SDR reception wait for averaging.
-Tuning, input gaps and sync resets clear its history. **W** remembers the toggle,
+Sync loss and reacquisition preserve the six-picture history. Tuning and input
+gaps clear it. **W** remembers the toggle,
 and **P** saves the displayed six-picture result without extra averaging.
 The window stays fixed at six; size, pause and fixed/rolling controls apply
 to the separate contest stack. Explicit `--stack-frames`/`--stack-rolling`

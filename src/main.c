@@ -815,7 +815,7 @@ static void frame(void *opaque, const uint32_t *pixels)
         a->decoder->fields-a->decoder->hsync_field<=2 &&
         a->decoder->tick-a->decoder->vsync_confirmed<a->decoder->rate*.060;
     int live_rolling=a->stacking && a->stack.rolling && a->c.rate<=10e6;
-    if(!live_rolling && !a->stack_paused && a->decoder->free_sync &&
+    if(!a->light_stacking && !live_rolling && !a->stack_paused && a->decoder->free_sync &&
        ((a->decoder->hsync_updates && !a->stack_hsync) ||
         (a->decoder->vsync_epoch && a->decoder->vsync_epoch!=a->stack_vsync) ||
         (synced && !a->stack_sync_input))) {
