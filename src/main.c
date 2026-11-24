@@ -106,6 +106,7 @@ typedef struct {
 
 typedef struct {
     uint64_t blocks, wait_ticks, read_overhead_ticks, processing_ticks, empty_reads;
+    uint64_t video_wait_ticks, guide_wait_ticks, pal_ticks;
 } BlockTiming;
 
 typedef struct {
@@ -185,6 +186,8 @@ static void sync_diagnostics_frame(App *a,uint32_t now,int horizontal,int vertic
         if(a->horizontal_locked && !horizontal) ++a->horizontal_losses;
         if(a->vertical_locked && !vertical) ++a->vertical_losses;
         if(a->sync_locked && !(horizontal && vertical)) ++a->sync_losses;
+    }
+    if(a->last_frame) {
         uint32_t gap=now-a->last_frame;
         if(gap>=150) ++a->frame_stalls;
         if(gap>a->max_frame_gap_ms) a->max_frame_gap_ms=gap;
@@ -344,7 +347,7 @@ static int diagnostic_snapshot(void *opaque,char *out,size_t capacity)
     Uint32 now=SDL_GetTicks(),elapsed=now-a->diagnosis_previous_tick;
     int have_rate=a->diagnosis_previous_tick && elapsed && a->consumed_samples>=a->diagnosis_previous_samples;
     double throughput=have_rate?(a->consumed_samples-a->diagnosis_previous_samples)*1000.0/elapsed/1e6:0;
-    char block_timing[384]="Block timing: awaiting completed blocks in a sampling interval\n";
+    char block_timing[512]="Block timing: awaiting completed blocks in a sampling interval\n";
     BlockTiming t=a->timing, prev=a->diagnosis_previous_timing;
     if(a->diagnosis_previous_tick && t.blocks>prev.blocks) {
         uint64_t blocks=t.blocks-prev.blocks;
@@ -352,10 +355,13 @@ static int diagnostic_snapshot(void *opaque,char *out,size_t capacity)
         snprintf(block_timing,sizeof(block_timing),
             "Receiver thread: %llu completed blocks; mean wall ms/block: empty queue wait=%.3f; "
             "other input read (including copy)=%.3f; block processing (including DSP waits)=%.3f; "
-            "empty reads=%llu in interval. Pluto RX runs concurrently.\n",
+            "empty reads=%llu in interval. Pluto RX runs concurrently.\n"
+            "Within processing (wall ms/block): video IF result wait=%.3f; sync IF additional wait=%.3f; PAL decode=%.3f.\n",
             (unsigned long long)blocks,(t.wait_ticks-prev.wait_ticks)*scale,
             (t.read_overhead_ticks-prev.read_overhead_ticks)*scale,(t.processing_ticks-prev.processing_ticks)*scale,
-            (unsigned long long)(t.empty_reads-prev.empty_reads));
+            (unsigned long long)(t.empty_reads-prev.empty_reads),
+            (t.video_wait_ticks-prev.video_wait_ticks)*scale,(t.guide_wait_ticks-prev.guide_wait_ticks)*scale,
+            (t.pal_ticks-prev.pal_ticks)*scale);
     }
     a->diagnosis_previous_timing=t;
     a->diagnosis_previous_tick=now; a->diagnosis_previous_samples=a->consumed_samples;
@@ -895,8 +901,9 @@ typedef struct {
     SDL_Thread *thread;
     SDL_mutex *mutex;
     SDL_cond *ready;
-    float *queue, *scratch;
-    size_t *lengths, block, slots, head, count, queued_samples;
+    float *storage, *scratch;
+    struct { float *samples; size_t length; } *queue;
+    size_t slots, head, count, queued_samples;
     int busy, stop, gap;
     double bandwidth;
     uint64_t discarded;
@@ -953,9 +960,7 @@ static void play_audio(void *opaque, const float *samples, size_t n)
 static void process_audio(void *opaque, const float *samples, size_t n)
 {
     Playback *p=opaque;
-    /* Keep carrier indicators current independently of the playback source.
-     * play_audio already forwards mono samples only when source == 0. */
-    sound_process(p->sound,samples,n);
+    sound_monitor(p->sound,samples,n,p->source==0);
     SDL_AtomicSet(&p->app->mono_detect,sound_locked(p->sound));
     int stereo_enabled=stereo_sound_enabled(p->app->c.rate,p->bandwidth);
     if(stereo_enabled) stereo_sound_monitor(p->stereo,samples,n,p->source>=2);
@@ -1002,8 +1007,11 @@ static int audio_worker(void *opaque)
     for(;;) {
         while(!p->count && !p->stop) SDL_CondWait(p->ready,p->mutex);
         if(!p->count && p->stop) break;
-        size_t n=p->lengths[p->head];
-        memcpy(p->scratch,p->queue+p->head*p->block,n*sizeof(float));
+        size_t n=p->queue[p->head].length;
+        /* Return the idle buffer to the producer before processing this one. */
+        float *samples=p->queue[p->head].samples;
+        p->queue[p->head].samples=p->scratch;
+        p->scratch=samples;
         p->head=(p->head+1)%p->slots; --p->count;
         p->queued_samples-=n; SDL_AtomicSet(&p->app->audio_dsp_queued,(int)p->queued_samples);
         int gap=p->gap; p->gap=0; p->busy=1;
@@ -1022,13 +1030,13 @@ static void enqueue_audio(void *opaque,const float *samples,size_t n)
     Playback *p=opaque;
     SDL_LockMutex(p->mutex);
     if(p->count==p->slots) {
-        for(size_t k=0;k<p->count;++k) p->discarded+=p->lengths[(p->head+k)%p->slots];
+        p->discarded+=p->queued_samples;
         p->head=p->count=p->queued_samples=0; p->gap=1; ++p->input_overflows;
         SDL_AtomicSet(&p->app->audio_dsp_overflows,(int)p->input_overflows);
     }
     size_t tail=(p->head+p->count)%p->slots;
-    memcpy(p->queue+tail*p->block,samples,n*sizeof(float));
-    p->lengths[tail]=n; ++p->count; p->queued_samples+=n;
+    memcpy(p->queue[tail].samples,samples,n*sizeof(float));
+    p->queue[tail].length=n; ++p->count; p->queued_samples+=n;
     SDL_AtomicSet(&p->app->audio_dsp_queued,(int)p->queued_samples);
     SDL_CondSignal(p->ready); SDL_UnlockMutex(p->mutex);
 }
@@ -1053,18 +1061,19 @@ static void stop_audio_worker(Playback *p)
     }
     if(p->ready) SDL_DestroyCond(p->ready);
     if(p->mutex) SDL_DestroyMutex(p->mutex);
-    free(p->queue); free(p->scratch); free(p->lengths);
-    p->ready=NULL; p->mutex=NULL; p->queue=p->scratch=NULL; p->lengths=NULL;
+    free(p->queue); free(p->storage);
+    p->ready=NULL; p->mutex=NULL; p->queue=NULL; p->storage=p->scratch=NULL;
 }
 static int start_audio_worker(Playback *p,size_t block)
 {
-    p->block=block;
     p->slots=(size_t)ceil(p->app->c.rate*.1/block);
     if(!p->slots) p->slots=1;
-    p->queue=calloc(p->slots,block*sizeof(float));
-    p->scratch=malloc(block*sizeof(float)); p->lengths=calloc(p->slots,sizeof(size_t));
+    p->storage=calloc(p->slots+1,block*sizeof(float));
+    p->queue=calloc(p->slots,sizeof(*p->queue));
     p->mutex=SDL_CreateMutex(); p->ready=SDL_CreateCond();
-    if(!p->queue || !p->scratch || !p->lengths || !p->mutex || !p->ready) goto fail;
+    if(!p->storage || !p->queue || !p->mutex || !p->ready) goto fail;
+    for(size_t k=0;k<p->slots;++k) p->queue[k].samples=p->storage+k*block;
+    p->scratch=p->storage+p->slots*block;
     p->thread=SDL_CreateThread(audio_worker,"Audio-DSP",p);
     if(!p->thread) goto fail;
     return 0;
@@ -1342,8 +1351,14 @@ static int worker(void *opaque)
         if(ready) {
             uint32_t measured_at;
             double if_power;
+            uint64_t wait_start=SDL_GetPerformanceCounter();
             video=alignment_previous(video_path,&if_power,&measured_at);
-            if(alignment) guide=alignment_previous(alignment,NULL,NULL);
+            uint64_t video_ready=SDL_GetPerformanceCounter();
+            pending_timing.video_wait_ticks+=video_ready-wait_start;
+            if(alignment) {
+                guide=alignment_previous(alignment,NULL,NULL);
+                pending_timing.guide_wait_ticks+=SDL_GetPerformanceCounter()-video_ready;
+            }
             SDL_LockMutex(a->mutex);
             a->if_power_dbfs=if_power; a->if_power_tick=measured_at;
             SDL_UnlockMutex(a->mutex);
@@ -1365,7 +1380,9 @@ static int worker(void *opaque)
                     SDL_UnlockMutex(a->mutex);
                 }
             }
+            uint64_t pal_start=SDL_GetPerformanceCounter();
             pal_pipeline_decode(pal,d,video,guide,ready);
+            pending_timing.pal_ticks+=SDL_GetPerformanceCounter()-pal_start;
             video_quality_process(&quality,video,ready,first_tick,quality_sync_valid(d),
                 d->free_origin,d->free_period>0?d->free_period:d->rate/d->line_hz,
                 (double)d->field,d->vsync_period>0?d->vsync_period:d->rate/50);
@@ -1397,6 +1414,9 @@ static int worker(void *opaque)
         a->timing.read_overhead_ticks+=pending_timing.read_overhead_ticks;
         a->timing.processing_ticks+=pending_timing.processing_ticks;
         a->timing.empty_reads+=pending_timing.empty_reads;
+        a->timing.video_wait_ticks+=pending_timing.video_wait_ticks;
+        a->timing.guide_wait_ticks+=pending_timing.guide_wait_ticks;
+        a->timing.pal_ticks+=pending_timing.pal_ticks;
         SDL_UnlockMutex(a->mutex);
         pending_timing=(BlockTiming){0};
         if (!strcmp(a->c.mode, "demo") || !strcmp(a->c.mode, "file")) {
@@ -2257,7 +2277,7 @@ static void help(void)
          "  --terminal-wizard      use the optional terminal wizard\n"
          "  W                     save current settings to startup file\n"
          "  --rate SPS             default 20000000; minimum 5000000 for Pluto, 8000000 otherwise\n"
-         "  --rx-block N           samples per receive call, 2048..1048576 (B210: 16384; Pluto: 131072; others: 32768)\n"
+         "  --rx-block N           samples per receive call, 2048..1048576 (B210: 65536; Pluto: 131072; others: 32768)\n"
          "  --bandwidth HZ         default 18000000\n"
          "  --gain DB              default 30; HackRF RX LNA 0..40 in 8 dB steps\n"
          "  --hackrf-amp 0|1       RF preamp off/on (default on)\n"

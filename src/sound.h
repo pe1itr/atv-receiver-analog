@@ -9,6 +9,8 @@ int sound_enabled(double rate, double bandwidth);
 Sound *sound_create(double rate, SoundOutput output, void *opaque);
 void sound_reset(Sound *s);
 void sound_process(void *opaque, const float *video, size_t n);
+/* Carrier statistics stay current when PCM output is disabled. */
+void sound_monitor(Sound *s,const float *video,size_t n,int playback);
 double sound_power(const Sound *s);
 int sound_locked(const Sound *s); /* Read only while processing is idle. */
 void sound_destroy(Sound *s);

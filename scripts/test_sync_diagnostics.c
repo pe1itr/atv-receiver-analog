@@ -101,6 +101,10 @@ int main(void)
     assert(a->frame_stalls==1 && a->max_frame_gap_ms==150 && a->sync_losses==2);
     observed(a,390,1,1);
     assert(a->frame_stalls==1 && a->max_frame_gap_ms==150);
+    /* A discontinuity clears the timestamp before the next frame. */
+    a->last_frame=0;
+    observed(a,600000,1,1);
+    assert(a->frame_stalls==1 && a->max_frame_gap_ms==150);
     /* SDL's millisecond clock wraps; short gaps must remain short. */
     a->last_frame=UINT32_MAX-9;
     observed(a,10,1,1);
@@ -121,13 +125,14 @@ int main(void)
     a->diagnosis_previous_tick=1;
     uint64_t freq=SDL_GetPerformanceFrequency();
     a->timing=(BlockTiming){.blocks=2,.wait_ticks=freq/2,.read_overhead_ticks=freq/50,
-        .processing_ticks=freq/4,.empty_reads=3};
+        .processing_ticks=freq/4,.empty_reads=3,.pal_ticks=freq/8};
     n=diagnostic_snapshot(a,diagnostic,sizeof(diagnostic));
     assert(n>0 && strstr(diagnostic,"2 completed blocks"));
     assert(strstr(diagnostic,"empty queue wait=250.000"));
     assert(strstr(diagnostic,"including copy)=10.000"));
     assert(strstr(diagnostic,"including DSP waits)=125.000"));
     assert(strstr(diagnostic,"empty reads=3"));
+    assert(strstr(diagnostic,"PAL decode=62.500"));
     diagnostic_snapshot(a,diagnostic,sizeof(diagnostic));
     assert(strstr(diagnostic,"awaiting completed blocks"));
     /* With flat demodulated video both detectors can explain the absent lock. */

@@ -10,7 +10,7 @@ struct Sound {
     double rate, cs, sn, c, s, output_phase;
     unsigned decimation, phase, pos, used;
     float alpha, re[4], im[4], old_re, old_im;
-    float fir[TAPS], history[TAPS], output[256];
+    float fir[TAPS], history[2*TAPS], output[256];
     double power, magnitude, frequency;
     float dc, deemphasis, gain;
     unsigned good;
@@ -51,7 +51,10 @@ static Sound *create_channel(double rate, double carrier, double cutoff, SoundOu
 }
 void sound_process(void *opaque, const float *video, size_t n)
 {
-    Sound *s=opaque;
+    sound_monitor(opaque,video,n,1);
+}
+void sound_monitor(Sound *s,const float *video,size_t n,int playback)
+{
     double intermediate=s->rate/s->decimation;
     const float fm_scale=intermediate/(2*PI*50000);
     const double stats=1-exp(-1/(intermediate*.020));
@@ -84,19 +87,20 @@ void sound_process(void *opaque, const float *video, size_t n)
         if(s->good>=(unsigned)(intermediate*.020)) s->locked=1;
         if(!s->good) s->locked=0;
         /* Monitoring needs carrier statistics, but no PCM filtering. */
-        if(!s->sink) continue;
-        s->history[s->pos]=fm; s->pos=(s->pos+1)%TAPS;
+        if(!playback || !s->sink) continue;
+        /* Mirror the delay line so both adjacent FIR windows are contiguous. */
+        s->pos=s->pos?s->pos-1:TAPS-1;
+        s->history[s->pos]=s->history[s->pos+TAPS]=fm;
         s->output_phase+=48000;
         if(s->output_phase<intermediate) continue;
         s->output_phase-=intermediate;
         /* Low-pass before resampling. Interpolate adjacent filtered instants
          * to retain an exact 48 kHz clock at arbitrary input sample rates. */
         double y=0, previous=0;
-        unsigned at=(s->pos+TAPS-1)%TAPS;
+        const float *history=s->history+s->pos;
         for(unsigned k=0;k<TAPS-1;++k) {
-            y+=s->fir[k]*s->history[at];
-            at=at?at-1:TAPS-1;
-            previous+=s->fir[k]*s->history[at];
+            y+=s->fir[k]*history[k];
+            previous+=s->fir[k]*history[k+1];
         }
         y+=(previous-y)*(s->output_phase/48000);
         s->dc+=.0039193f*(y-s->dc); /* 30 Hz DC blocker. */

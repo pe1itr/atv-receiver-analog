@@ -164,8 +164,8 @@ static int ask(Settings *s,SettingsPromptFn prompt,void *opaque,const char *key,
 }
 size_t settings_default_rx_block(const char *mode)
 {
-    /* Hardware-tested receive block sizes; keep B210 tuning responsive. */
-    if(!strcmp(mode,"b210")) return 16384;
+    /* Eight PAL work chunks per B210 transfer at the default 20 MS/s. */
+    if(!strcmp(mode,"b210")) return 65536;
     return !strcmp(mode,"pluto")?131072:BLOCK;
 }
 static int ask_rx_block(Settings *s,SettingsPromptFn prompt,void *opaque)

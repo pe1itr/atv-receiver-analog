@@ -364,7 +364,7 @@ selects analog bandwidth as sample rate minus 1 MHz below 8 MS/s, or minus
 sync/alignment path defaults to 3.2 MHz. Actual device settings are read back
 from the driver.
 
-Default receive blocks are 16384 samples for B210, 131072 for Pluto and 32768
+Default receive blocks are 65536 samples for B210, 131072 for Pluto and 32768
 for other sources. `--rx-block N` accepts 2048–1048576 samples. Larger blocks
 reduce per-transfer overhead but increase buffering latency.
 
